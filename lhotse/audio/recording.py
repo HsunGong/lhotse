@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from math import ceil, isclose
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -487,6 +487,28 @@ class Recording:
             )
 
         return audio
+
+    @rich_exception_info
+    def load_video_iter(
+        self,
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        subsampling_rate: Optional[int] = None,
+    ) -> Iterable[Tuple[float, np.ndarray]]:
+        """
+        Read the video frames from the underlying video source (path, URL, unix pipe/command).
+        :param offset: seconds, where to start reading the video (at offset 0 by default).
+        :param duration: seconds, indicates the total video time to read (starting from ``offset``).
+        :param subsampling_rate: int, the sub-sampling rate for the video frames.
+        :return: an iterable of tuples, each containing
+            (timestamp in seconds, video frame as a numpy array, shape (H, W, C)).
+        """
+        assert self.has_video, f"Recording {self.id} has no video to load."
+        return self._video_source.load_video_iter(
+            offset=offset,
+            duration=duration,
+            subsampling_rate=subsampling_rate,
+        )
 
     @rich_exception_info
     def load_video(

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from io import BytesIO, FileIO
 from pathlib import Path
 from subprocess import PIPE, run
-from typing import List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import soundfile as sf
@@ -112,6 +112,38 @@ class AudioSource:
                 )
 
         return samples.astype(np.float32)
+
+    def load_video_iter(
+        self,
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        subsampling_rate: Optional[int] = None,
+    ) -> Iterable[Tuple[float, np.ndarray]]:
+        if duration is None:
+            duration = self.video.duration - offset
+
+        import cv2
+
+        cap = cv2.VideoCapture(self.source)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {self.source}")
+
+        # processing
+        start_frame = int(offset * self.video.fps)
+        end_frame = int(duration * self.video.fps)
+
+        if subsampling_rate is None:
+            subsampling_rate = 1
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        while cap.isOpened() and start_frame < end_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if start_frame % subsampling_rate == 0:
+                yield (start_frame / self.video.fps, frame)
+            start_frame += 1
+        cap.release()
 
     def load_video(
         self,

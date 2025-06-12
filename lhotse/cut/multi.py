@@ -132,6 +132,34 @@ class MultiCut(DataCut):
         return None
 
     @rich_exception_info
+    def load_video_iter(
+        self,
+        subsampling_rate: Optional[int] = None,
+        frame_rate: Optional[float] = None,
+    ) -> Iterable[Tuple[float, np.ndarray]]:
+        """
+        Load the subset of video frames from attached recording.
+        The data is trimmed to the [begin, end] range specified by the MultiCut.
+        :subsampling_rate: optional int, the sub-sample rate to use for loading the video.
+        :param frame_rate: optional float, the frame rate to use for loading the video.
+        :return: an iterable of tuples (timestamp, frame), where timestamp is the time in seconds
+            and frame is a numpy array with shape (H, W, C) representing the video frame.
+        """
+        # assert only one of subsampling_rate and frame_rate should be set
+        if frame_rate:
+            assert subsampling_rate is None
+            subsampling_rate = int(round(frame_rate // self.video.fps))
+
+        if self.has_video:
+            return self.recording.load_video_iter(
+                offset=self.start,
+                duration=self.duration,
+                subsampling_rate=subsampling_rate,
+            )
+        else:
+            return []
+
+    @rich_exception_info
     def load_video(
         self,
         channel: Optional[Union[int, List[int]]] = None,
