@@ -778,7 +778,7 @@ class SmartOpenIOBackend(IOBackend):
     """Uses `smart_open` library (if installed) to auto-determine how to handle the URI."""
 
     def open(self, identifier: Pathlike, mode: str):
-        return SmartOpen.open(identifier, mode)
+        return SmartOpen.open(identifier, mode, encoding="utf-8")
 
     @classmethod
     def is_available(cls) -> bool:
