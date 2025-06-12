@@ -120,12 +120,22 @@ def import_(
         "This helps avoid issues with Kaldi data dir sorting."
     ),
 )
+@click.option(
+    "--maintain-line-break",
+    is_flag=True,
+    help=(
+        "When set, the text field in the supervision segments will "
+        "maintain line breaks (i.e. '\\n' characters) as they are, "
+        "instead of replacing them with spaces."
+    ),
+)
 def export(
     recordings: Pathlike,
     supervisions: Pathlike,
     output_dir: Pathlike,
     map_underscores_to: Optional[str],
     prefix_spk_id: Optional[bool] = False,
+    maintain_line_break: Optional[bool] = False,
 ):
     """
     Convert a pair of ``RecordingSet`` and ``SupervisionSet`` manifests into a Kaldi-style data directory.
@@ -140,6 +150,90 @@ def export(
         output_dir=output_dir,
         map_underscores_to=map_underscores_to,
         prefix_spk_id=prefix_spk_id,
+        maintain_line_break=maintain_line_break,
+    )
+    click.secho(
+        "Export completed! You likely need to run the following Kaldi commands:",
+        bold=True,
+        fg="yellow",
+    )
+    click.secho(
+        f"  utils/utt2spk_to_spk2utt.pl {output_dir}/utt2spk > {output_dir}/spk2utt",
+        fg="yellow",
+    )
+    click.secho(f"  utils/fix_data_dir.sh {output_dir}", fg="yellow")
+
+
+@kaldi.command("")
+@click.argument("cuts", type=click.Path(exists=True, dir_okay=False))
+@click.argument("output_dir", type=click.Path())
+@click.option(
+    "-u",
+    "--map-underscores-to",
+    type=str,
+    default=None,
+    help=(
+        "Optional string with which we will replace all underscores."
+        "This helps avoid issues with Kaldi data dir sorting."
+    ),
+)
+@click.option(
+    "-p",
+    "--prefix-spk-id",
+    is_flag=True,
+    help=(
+        "Prefix utterance ids with speaker ids."
+        "This helps avoid issues with Kaldi data dir sorting."
+    ),
+)
+@click.option(
+    "--maintain-line-break",
+    is_flag=True,
+    help=(
+        "When set, the text field in the supervision segments will "
+        "maintain line breaks (i.e. '\\n' characters) as they are, "
+        "instead of replacing them with spaces."
+    ),
+)
+def cut_export(
+    cuts: Pathlike,
+    output_dir: Pathlike,
+    map_underscores_to: Optional[str],
+    prefix_spk_id: Optional[bool] = False,
+    maintain_line_break: Optional[bool] = False,
+):
+    click.secho(
+        f"Loading cut set from {cuts}",
+        bold=True,
+        fg="yellow",
+    )
+
+    from lhotse import CutSet, RecordingSet, SupervisionSet
+
+    cut_set = CutSet.from_file(cuts)
+    recordings = []
+    rids = set()
+    for c in cut_set:
+        if c.recording_id not in rids:
+            recordings.append(c.recording)
+            rids.add(c.recording_id)
+
+    recording_set = RecordingSet(list(recordings))
+    supervisions = list()
+    for c in cut_set:
+        supervisions.extend(c.supervisions)
+    supervision_set = SupervisionSet.from_segments(supervisions)
+    from lhotse.kaldi import export_to_kaldi
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    export_to_kaldi(
+        recordings=recording_set,
+        supervisions=supervision_set,
+        output_dir=output_dir,
+        map_underscores_to=map_underscores_to,
+        prefix_spk_id=prefix_spk_id,
+        maintain_line_break=maintain_line_break,
     )
     click.secho(
         "Export completed! You likely need to run the following Kaldi commands:",

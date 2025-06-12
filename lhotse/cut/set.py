@@ -1086,6 +1086,37 @@ class CutSet(Serializable, AlgorithmMixin):
         )
         return result
 
+    def reverse_trim_to_supervisions(self) -> "CutSet":
+        """
+        Reverse trim to supervisions to single cut, required keep_overlapping=False,
+        """
+        recordings = defaultdict(list)
+        for cut in self:
+            recordings[cut.recording_id].append(cut)
+
+        new_cuts = []
+        for rid, cuts in recordings.items():
+            # assert all(isinstance(c, MonoCut) == 1 for c in cuts)
+            new_sups = []
+            for cut in sorted(cuts, key=lambda x: x.start):
+                for sup in sorted(
+                    cut.supervisions, key=lambda x: (x.start, x.duration)
+                ):
+                    new_sups.append(fastcopy(sup, start=cut.start + sup.start))
+
+            first_cut = cuts[0]
+            new_cuts.append(
+                fastcopy(
+                    first_cut,
+                    id=rid,
+                    start=0,
+                    duration=first_cut.recording.duration,
+                    supervisions=new_sups,
+                )
+            )
+
+        return CutSet(new_cuts)
+
     def trim_to_alignments(
         self,
         type: str,

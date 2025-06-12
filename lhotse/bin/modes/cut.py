@@ -502,3 +502,145 @@ def estimate_bucket_bins(
     if sample is not None:
         cuts = cuts.subset(first=sample)
     click.echo(estimate_duration_buckets(cuts, num_buckets=num_buckets))
+
+
+@cut.command("to_textgrid")
+@click.argument("cut_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("output_dir", type=click.Path())
+@click.option(
+    "-tt",
+    "--text-type",
+    default="text",
+    help="Text to use for the TextGrid, should be:"
+    "`text`, or `alignment-XXX`, where XXX is the key name of supervision.alignment",
+)
+def to_textgrid(cut_path: Pathlike, output_dir: Pathlike, text_type: str):
+    """
+    Export the supervisions from CUTSET to a Praat TextGrid file.
+    """
+    from praatio import textgrid
+
+    cut_set = CutSet.from_file(cut_path)
+    cut_set = cut_set.reverse_trim_to_supervisions()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for cut in cut_set:
+        rec_id = cut.recording_id
+        assert (
+            cut.recording.duration == cut.duration
+        ), f"Cut duration mismatch for {rec_id}"
+
+        # 1 cut for 1 recording
+        tg = textgrid.Textgrid()
+        spk_tiers = {}
+        for sup in cut.supervisions:
+            speaker = sup.speaker if sup.speaker is not None else "unknown"
+            if speaker not in spk_tiers:
+                spk_tiers[speaker] = textgrid.IntervalTier(
+                    speaker, [], minT=0, maxT=cut.duration
+                )
+            tier = spk_tiers[speaker]
+
+            if text_type == "text":
+                assert sup.text is not None, f"Supervision text is None for {sup}"
+                tier.insertEntry(
+                    (round(sup.start, 3), round(sup.start + sup.duration, 3), sup.text)
+                )
+            else:
+                text_type = text_type.split("-", maxsplit=1)[-1].strip()
+                key = text_type.split(" ", maxsplit=1)[-1]
+                alis = sup.alignment[key]
+                assert len(alis) > 0
+                end = 0
+                for ali in alis:
+                    # TODO: print((max(ali[1], end), ali[1] + ali[2], ali[0]))
+                    tier.insertEntry((ali.start, ali.start + ali.duration, ali.symbol))
+                    end = ali[1] + ali[2]
+
+        for tier in spk_tiers.values():
+            tg.addTier(tier)
+        tg.save(
+            output_dir / f"{rec_id}.TextGrid",
+            format="long_textgrid",
+            includeBlankSpaces=False,
+        )
+
+
+@cut.command(name="from_textgrid")
+@click.argument("data_dir", type=click.Path(exists=True, file_okay=False))
+@click.argument("manifest_dir", type=click.Path())
+def from_textgrid(
+    data_dir: Pathlike,
+    manifest_dir: Pathlike,
+):
+    """
+    Should be MFA-like data directory which contains TextGrid
+    """
+    from praatio import textgrid
+    from praatio.utilities import constants
+    from tqdm import tqdm
+
+    from lhotse import validate_recordings_and_supervisions
+    from lhotse.audio import Recording, RecordingSet
+    from lhotse.cut import Cut, CutSet
+    from lhotse.qa import fix_manifests
+    from lhotse.supervision import SupervisionSegment, SupervisionSet
+
+    click.echo("Loading MFA style data with raw audios and textgrid annotations")
+
+    global_spk_id = {}
+    recordings = []
+    supervisions = []
+
+    for tgrid_path in tqdm(Path(data_dir).rglob("*.TextGrid")):
+        tg = textgrid.openTextgrid(
+            tgrid_path, includeEmptyIntervals=False, reportingMode="warning"
+        )
+
+        for ext in [".wav", ".mp3", ".flac"]:
+            if tgrid_path.with_suffix(ext).exists():
+                audio_path = tgrid_path.with_suffix(ext)
+                break
+        else:
+            raise ValueError(f"Audio file not found for {tgrid_path}")
+
+        idx = audio_path.stem
+        recording = Recording.from_file(audio_path)
+        recordings.append(recording)
+
+        for tier in tg.tiers:
+            spk_id = f"{idx}-{tier.name}"
+            for j, interval in enumerate(tier.entries):
+                if interval.label == "":
+                    continue
+                assert isinstance(interval, constants.Interval)
+                start = interval.start
+                end = interval.end
+                text = interval.label
+                segment = SupervisionSegment(
+                    id=f"{spk_id}-{idx}-{j:05d}",
+                    recording_id=idx,
+                    start=start,
+                    duration=round(end - start, 4),
+                    channel=recording.channel_ids,
+                    speaker=spk_id,
+                    text=text.strip(),
+                )
+                supervisions.append(segment)
+
+    recording_set = RecordingSet.from_recordings(recordings)
+    supervision_set = SupervisionSet.from_segments(supervisions)
+    recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
+    validate_recordings_and_supervisions(recording_set, supervision_set)
+
+    manifest_dir = Path(manifest_dir)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+
+    recording_set.to_file(manifest_dir / "recordings.jsonl.gz")
+    supervision_set.to_file(manifest_dir / "supervisions.jsonl.gz")
+    CutSet.from_manifests(
+        recordings=recording_set,
+        supervisions=supervision_set,
+        tolerance=0.1,
+    ).to_file(manifest_dir / "cuts.jsonl.gz")

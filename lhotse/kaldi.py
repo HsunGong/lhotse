@@ -113,15 +113,32 @@ def load_kaldi_data_dir(
         return t.replace(map_string_to_underscores, "_")
 
     # must exist for RecordingSet
+    logging.info("Loading Kaldi wav.scp from: " + str(path))
     recordings = load_kaldi_text_mapping(path / "wav.scp", must_exist=True)
-    reco2dur = path / "reco2dur"
-    if use_reco2dur and reco2dur.is_file():
-        durations = load_kaldi_text_mapping(reco2dur, float_vals=True)
-        assert len(durations) == len(recordings), (
-            "The duration file reco2dur does not "
-            "have the same length as the  wav.scp file"
-        )
-    else:
+    if use_reco2dur:
+        use_reco2dur = False
+        reco2dur = path / "reco2dur"
+        if reco2dur.is_file():
+            logging.info("Loading Kaldi reco2dur from: " + str(path))
+            use_reco2dur = True
+            durations = load_kaldi_text_mapping(reco2dur, float_vals=True)
+            assert len(durations) == len(recordings), (
+                "The duration file reco2dur does not "
+                "have the same length as the  wav.scp file"
+            )
+
+        utt2dur = path / "utt2dur"
+        if utt2dur.is_file() and not (path / "segments").is_file():
+            logging.info("Loading Kaldi utt2dur from: " + str(path))
+            use_reco2dur = True
+            durations = load_kaldi_text_mapping(utt2dur, float_vals=True)
+            assert len(durations) == len(recordings), (
+                "The duration file utt2dur does not "
+                "have the same length as the  wav.scp file"
+            )
+
+    if not use_reco2dur:
+        logging.info("Generating Duration from: " + str(path))
         # ProcessPoolExecutor hanging observed for datasets with >100k recordings.
         # Using large chunks to be processed per child processes is advised here:
         # https://docs.python.org/3/library/concurrent.futures.html
@@ -151,6 +168,7 @@ def load_kaldi_data_dir(
         )
 
     # assemble the new RecordingSet
+    logging.info("Loading RecordingSet from: " + str(path))
     recording_set = RecordingSet.from_recordings(
         Recording(
             id=recording_id,
@@ -176,6 +194,7 @@ def load_kaldi_data_dir(
     feats_scp = path / "feats.scp"
 
     # load mapping from utt_id to start and duration
+    logging.info("Loading start_and_duration from feats.scp: " + str(path))
     utt_id_to_start_and_duration = load_start_and_duration(
         segments_path=segments,
         feats_path=feats_scp,
@@ -183,6 +202,7 @@ def load_kaldi_data_dir(
     )
 
     if segments.is_file():
+        logging.info("Loading segments style dir: " + str(path))
         supervisions = []
         with segments.open() as f:
             supervision_segments = [sup_string.strip().split() for sup_string in f]
@@ -222,12 +242,14 @@ def load_kaldi_data_dir(
     elif utt2spk_f.is_file():
         # segments file does not exist => provided supervision
         # corresponds to whole recordings
+        logging.info("Loading utt2spk style dir: " + str(path))
         speakers = load_kaldi_text_mapping(path / "utt2spk")
         assert len(speakers) == len(recording_set)
 
         texts = load_kaldi_text_mapping(path / "text")
         genders = load_kaldi_text_mapping(path / "spk2gender")
         languages = load_kaldi_text_mapping(path / "utt2lang")
+        scores = load_kaldi_text_mapping(path / "score", float_vals=True)
         supervision_set = SupervisionSet.from_segments(
             SupervisionSegment(
                 id=fix_id(rec_id),
@@ -292,12 +314,149 @@ def load_kaldi_data_dir(
     return recording_set, supervision_set, feature_set
 
 
+def load_kaldi_supervision_set(
+    path: Pathlike,
+    text_path: Pathlike,
+    sampling_rate: int = 16000,
+):
+    texts = load_kaldi_text_mapping(text_path)
+
+    speakers = load_kaldi_text_mapping(path / "utt2spk")
+    genders = load_kaldi_text_mapping(path / "spk2gender")
+    languages = load_kaldi_text_mapping(path / "utt2lang")
+    durations = load_kaldi_text_mapping(path / "utt2dur")
+
+    segments = path / "segments"
+    if segments.is_file():
+        logging.info("Segments file found: " + str(segments))
+        supervisions = []
+        with segments.open() as f:
+            # supervision_segments = [sup_string.strip().split() for sup_string in f]
+            # for segment_id, recording_id, start, end in supervision_segments:
+
+            for sup_string in f:
+                segment_id, recording_id, start, end = sup_string.strip().split()
+                # to support <end-time> == -1 in segments file
+                # https://kaldi-asr.org/doc/extract-segments_8cc.html
+                # <end-time> of -1 means the segment runs till the end of the WAV file
+                duration = add_durations(
+                    float(end) if end != "-1" else durations[recording_id],
+                    -float(start),
+                    sampling_rate=sampling_rate,
+                )
+                supervisions.append(
+                    SupervisionSegment(
+                        id=segment_id,
+                        recording_id=recording_id,
+                        start=float(start),
+                        duration=duration,
+                        channel=0,
+                        text=texts[segment_id],
+                        language=languages[segment_id],
+                        speaker=speakers[segment_id],
+                        gender=genders[speakers[segment_id]],
+                    )
+                )
+    else:
+        supervisions = []
+        for rec_id, spkr in speakers.items():
+            sup = SupervisionSegment(
+                id=rec_id,
+                recording_id=rec_id,
+                start=0.0,
+                duration=durations[rec_id],
+                channel=0,
+                text=texts[rec_id],
+                language=languages[rec_id],
+                speaker=spkr,
+                gender=genders[spkr],
+            )
+            supervisions.append(sup)
+
+    supervision_set = SupervisionSet.from_segments(supervisions)
+    return supervision_set
+
+
+def load_kaldi_recording_set(
+    path: Pathlike,
+    sampling_rate: int,
+    frame_shift: Optional[Seconds] = None,
+    use_reco2dur: bool = True,
+    num_jobs: int = 1,
+):
+    path = Path(path)
+    assert path.is_dir()
+    # must exist for RecordingSet
+    logging.info("Loading Kaldi wav.scp from: " + str(path))
+    recordings = load_kaldi_text_mapping(path / "wav.scp", must_exist=True)
+    reco2dur = path / "reco2dur"
+    if use_reco2dur and reco2dur.is_file():
+        logging.info("Loading Kaldi reco2dur from: " + str(path))
+        durations = load_kaldi_text_mapping(reco2dur, float_vals=True)
+        assert len(durations) == len(recordings), (
+            "The duration file reco2dur does not "
+            "have the same length as the  wav.scp file"
+        )
+    else:
+        logging.info("Generating Duration from: " + str(path))
+        # ProcessPoolExecutor hanging observed for datasets with >100k recordings.
+        # Using large chunks to be processed per child processes is advised here:
+        # https://docs.python.org/3/library/concurrent.futures.html
+        #
+        # num_chunks = num_jobs * 10, e.g. 250
+        chunksize = max(1, len(recordings) // (num_jobs * 10))
+        with ProcessPoolExecutor(max_workers=num_jobs) as ex:
+            dur_vals = list(
+                ex.map(get_duration, recordings.values(), chunksize=chunksize)
+            )
+
+        durations = dict(zip(recordings.keys(), dur_vals))
+
+    # remove recordings with 'None' duration (i.e. there was a read error)
+    for recording_id, dur_value in durations.items():
+        if dur_value is None:
+            logging.warning(
+                f"[{recording_id}] Could not get duration. "
+                f"Failed to read audio from `{recordings[recording_id]}`. "
+                "Dropping the recording from manifest."
+            )
+            del recordings[recording_id]
+    # make sure not too many utterances were dropped
+    if len(recordings) < len(durations) * 0.8:
+        raise RuntimeError(
+            f'Failed to load more than 20% utterances of the dataset: "{path}"'
+        )
+
+    # assemble the new RecordingSet
+    logging.info("Loading RecordingSet from: " + str(path))
+    recording_set = RecordingSet.from_recordings(
+        Recording(
+            id=recording_id,
+            sources=[
+                AudioSource(
+                    type="command" if path_or_cmd.endswith("|") else "file",
+                    channels=[0],
+                    source=path_or_cmd[:-1]
+                    if path_or_cmd.endswith("|")
+                    else path_or_cmd,
+                )
+            ],
+            sampling_rate=sampling_rate,
+            num_samples=compute_num_samples(durations[recording_id], sampling_rate),
+            duration=durations[recording_id],
+        )
+        for recording_id, path_or_cmd in recordings.items()
+    )
+    return recording_set
+
+
 def export_to_kaldi(
     recordings: RecordingSet,
     supervisions: SupervisionSet,
     output_dir: Pathlike,
     map_underscores_to: Optional[str] = None,
     prefix_spk_id: Optional[bool] = False,
+    maintain_line_break: Optional[bool] = False,
 ):
     """
     Export a pair of ``RecordingSet`` and ``SupervisionSet`` to a Kaldi data
@@ -314,6 +473,7 @@ def export_to_kaldi(
         underscores. This helps avoid issues with Kaldi data dir sorting.
     :param prefix_spk_id: add speaker_id as a prefix of utterance_id (this is to
         ensure correct sorting inside files which is required by Kaldi)
+    :param maintain_line_break: if True, the text field of the supervisions will replace possible `\n` to ` `
 
     .. note:: If you export a ``RecordingSet`` with multiple channels, then the
         resulting Kaldi data directory may not be back-compatible with Lhotse
@@ -370,10 +530,19 @@ def export_to_kaldi(
         )
 
         # text
-        save_kaldi_text_mapping(
-            data={sup.id: sup.text for sup in supervisions},
-            path=output_dir / "text",
-        )
+        if maintain_line_break:
+            save_kaldi_text_mapping(
+                data={sup.id: sup.text for sup in supervisions},
+                path=output_dir / "text",
+            )
+        else:
+            save_kaldi_text_mapping(
+                data={
+                    sup.id: sup.text.replace("\n", " ") if sup.text else ""
+                    for sup in supervisions
+                },
+                path=output_dir / "text",
+            )
         # utt2spk
         save_kaldi_text_mapping(
             data={sup.id: sup.speaker for sup in supervisions},
@@ -526,7 +695,14 @@ def load_kaldi_text_mapping(
     mapping = defaultdict(lambda: None)
     if path.is_file():
         with path.open() as f:
-            mapping = dict(line.strip().split(maxsplit=1) for line in f)
+            for line in f:
+                try:
+                    k, v = line.strip().split(maxsplit=1)
+                except:
+                    k = line.strip()
+                    v = ""
+                mapping[k] = v
+            # mapping = dict(line.strip().split(maxsplit=1) for line in f)
         if float_vals:
             mapping = {key: float(val) for key, val in mapping.items()}
     elif must_exist:
