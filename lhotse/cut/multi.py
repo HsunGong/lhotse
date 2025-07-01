@@ -144,6 +144,7 @@ class MultiCut(DataCut):
         :param frame_rate: optional float, the frame rate to use for loading the video.
         :return: an iterable of tuples (timestamp, frame), where timestamp is the time in seconds
             and frame is a numpy array with shape (H, W, C) representing the video frame.
+            timestamp is a relative value compared with offset.
         """
         # assert only one of subsampling_rate and frame_rate should be set
         if frame_rate:

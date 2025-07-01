@@ -502,6 +502,7 @@ class Recording:
         :param subsampling_rate: int, the sub-sampling rate for the video frames.
         :return: an iterable of tuples, each containing
             (timestamp in seconds, video frame as a numpy array, shape (H, W, C)).
+            timestamp is a relative value compared with offset.
         """
         assert self.has_video, f"Recording {self.id} has no video to load."
         return self._video_source.load_video_iter(

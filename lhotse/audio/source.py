@@ -119,6 +119,10 @@ class AudioSource:
         duration: Optional[Seconds] = None,
         subsampling_rate: Optional[int] = None,
     ) -> Iterable[Tuple[float, np.ndarray]]:
+        """
+        This function return timestamp is a relative timestamp compared with offset.
+        Meanwhile, the first/last frame is also included for clearer bounding
+        """
         if duration is None:
             duration = self.video.duration - offset
 
@@ -129,20 +133,22 @@ class AudioSource:
             raise RuntimeError(f"Failed to open video: {self.source}")
 
         # processing
-        start_frame = int(offset * self.video.fps)
-        end_frame = int(duration * self.video.fps)
-
+        offset_frame_idx = int(offset * self.video.fps)
+        duration_frame_idx = int(duration * self.video.fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, offset_frame_idx)
         if subsampling_rate is None:
             subsampling_rate = 1
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        while cap.isOpened() and start_frame < end_frame:
+        last_frame = None
+        for frame_idx in range(duration_frame_idx):
             ret, frame = cap.read()
             if not ret:
                 break
-            if start_frame % subsampling_rate == 0:
-                yield (start_frame / self.video.fps, frame)
-            start_frame += 1
+            last_frame = frame
+            if frame_idx % subsampling_rate == 0:
+                yield (frame_idx / self.video.fps, last_frame)
+
+        yield ((frame_idx - 1) / self.video.fps, last_frame)
         cap.release()
 
     def load_video(
