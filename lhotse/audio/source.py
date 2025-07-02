@@ -1,4 +1,5 @@
 import io
+import math
 import os
 import warnings
 from dataclasses import dataclass
@@ -133,22 +134,28 @@ class AudioSource:
             raise RuntimeError(f"Failed to open video: {self.source}")
 
         # processing
-        offset_frame_idx = int(offset * self.video.fps)
-        duration_frame_idx = int(duration * self.video.fps)
+        # offset 向上取整 -> 避免越界
+        # duration 向下取整 -> 避免越界
+        offset_frame_idx = math.ceil(offset * self.video.fps)
+        duration_frame_idx = math.floor(duration * self.video.fps)
         cap.set(cv2.CAP_PROP_POS_FRAMES, offset_frame_idx)
+        EPS = (offset_frame_idx / self.video.fps) - offset
         if subsampling_rate is None:
             subsampling_rate = 1
 
         last_frame = None
-        for frame_idx in range(duration_frame_idx):
+        frame_idx = 0
+        while frame_idx < duration_frame_idx and cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            last_frame = frame
             if frame_idx % subsampling_rate == 0:
-                yield (frame_idx / self.video.fps, last_frame)
+                yield (frame_idx / self.video.fps + EPS, frame)
 
-        yield ((frame_idx - 1) / self.video.fps, last_frame)
+            last_frame = frame
+            frame_idx += 1
+
+        yield ((frame_idx - 1) / self.video.fps + EPS, last_frame)
         cap.release()
 
     def load_video(
