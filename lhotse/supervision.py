@@ -3,11 +3,13 @@ from collections import defaultdict
 from dataclasses import dataclass
 from itertools import groupby, islice
 from typing import (
+    Annotated,
     Any,
     Callable,
     Dict,
     Iterable,
     List,
+    Literal,
     Mapping,
     NamedTuple,
     Optional,
@@ -35,6 +37,21 @@ from lhotse.utils import (
     split_manifest_lazy,
     split_sequence,
 )
+
+
+@dataclass
+class OCRItem:
+    """
+    This class contains an OCR item, for example a word, along with its
+    start time, end time, final bbox and the candidate texts.
+    """
+
+    start: float
+    end: float
+    bbox: Annotated[list[int], Literal[4]]
+    candidate_texts: list[str]
+    candidate_scores: list[float]
+    end_index: int = 0
 
 
 class AlignmentItem(NamedTuple):
