@@ -486,7 +486,11 @@ def read_audio_from_cuts(
     suppress_errors: bool = False,
     recording_field: Optional[str] = None,
     filter_aux_iter: Optional[Iterable] = None,
-) -> Union[Tuple[List[torch.Tensor], CutSet], Tuple[List[torch.Tensor], CutSet, List]]:
+    return_tensor: bool = True,
+) -> Union[
+    Tuple[List[Union[torch.Tensor, np.ndarray]], CutSet],
+    Tuple[List[Union[torch.Tensor, np.ndarray]], CutSet, List],
+]:
     """
     Loads audio data from an iterable of cuts.
 
@@ -501,6 +505,7 @@ def read_audio_from_cuts(
     :param filter_aux_iter: when specified, we will iterate over this iterator and discard the elements
         for which a corresponding cut failed to load audio, if ``suppress_errors`` is set to ``True``.
         This iterator is expected to be of the same length as ``cuts``.
+    :param return_tensor:  if True (default), return a torch.Tensor; if False, return a numpy array.
     :return: a tuple of two items: a list of audio tensors (with different shapes),
         and a list of cuts for which we read the data successfully.
         If ``filter_aux_iter`` is specified, it returns a 3-tuple where the third element is
@@ -522,6 +527,7 @@ def read_audio_from_cuts(
                     _read_audio,
                     suppress_errors=suppress_errors,
                     recording_field=recording_field,
+                    return_tensor=return_tensor,
                 ),
                 cuts,
             ),
@@ -594,7 +600,10 @@ def read_features_from_cuts(
 
 
 def _read_audio(
-    cut: Cut, suppress_errors: bool = False, recording_field: Optional[str] = None
+    cut: Cut,
+    suppress_errors: bool = False,
+    recording_field: Optional[str] = None,
+    return_tensor: bool = True,
 ) -> Optional[torch.Tensor]:
     """
     Loads audio data from cut, or returns None if there was an error
@@ -611,7 +620,10 @@ def _read_audio(
             audio = cut.load_custom(recording_field)
         if audio.shape[0] == 1:
             audio = audio.squeeze(0)  # collapse channel dim if mono
-        return torch.from_numpy(audio)
+        if return_tensor:
+            return torch.from_numpy(audio)
+        else:
+            return audio
 
 
 def _read_features(cut: Cut) -> torch.Tensor:

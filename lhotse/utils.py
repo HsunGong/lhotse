@@ -844,6 +844,7 @@ def lens_to_mask(lens: torch.IntTensor) -> torch.Tensor:
 def rich_exception_info(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
         try:
             return fn(*args, **kwargs)
         except Exception as e:

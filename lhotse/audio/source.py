@@ -12,6 +12,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
+from lhotse.array import TemporalArray
 from lhotse.audio.backend import read_audio
 from lhotse.audio.utils import (
     DurationMismatchError,
@@ -46,6 +47,8 @@ class AudioSource:
     - 'url' (any URL type that is supported by "smart_open" library, e.g. http/https/s3/gcp/azure/etc.)
     - 'memory' (any format, read from a binary string attached to 'source' member of AudioSource)
     - 'shar' (indicates a placeholder that will be filled later when using Lhotse Shar data format)
+    - 'ndarray' tuple(np.ndarray, int) same shape as sf.read
+    - 'array' tuple(lhotse.Array, int) same shape as sf.read
     """
 
     channels: List[int]
@@ -53,7 +56,7 @@ class AudioSource:
     A list of integer channel IDs available in this AudioSource.
     """
 
-    source: Union[str, bytes]
+    source: Union[str, bytes, tuple[np.ndarray, int], tuple[TemporalArray, int]]
     """
     The actual source to read from. The contents depend on the ``type`` field,
     but in general it can be a path, a URL, or the encoded binary data itself.
@@ -77,7 +80,8 @@ class AudioSource:
         offset: Seconds = 0.0,
         duration: Optional[Seconds] = None,
         force_opus_sampling_rate: Optional[int] = None,
-    ) -> np.ndarray:
+        return_rate: bool = False,
+    ) -> Union[np.ndarray, tuple[np.ndarray, int]]:
         """
         Load the AudioSource (from files, commands, or URLs) with soundfile,
         accounting for many audio formats and multi-channel inputs.
@@ -87,17 +91,38 @@ class AudioSource:
         Note: The elements in the returned array are in the range [-1.0, 1.0]
         and are of dtype `np.float32`.
 
+        :param offset: Start reading after this time (in seconds).
+        :param duration: Read at most this many seconds of audio.
         :param force_opus_sampling_rate: This parameter is only used when we detect an OPUS file.
             It will tell ffmpeg to resample OPUS to this sampling rate.
+        :param return_rate: If True, return a tuple (samples, sampling_rate).
+
+        :return: The loaded audio samples, and the sampling rate if `return_rate` is True.
         """
         source = self._prepare_for_reading(offset=offset, duration=duration)
 
-        samples, sampling_rate = read_audio(
-            source,
-            offset=offset,
-            duration=duration,
-            force_opus_sampling_rate=force_opus_sampling_rate,
-        )
+        if isinstance(source, tuple) and isinstance(source[0], np.ndarray):
+            samples, sampling_rate = source
+            left_offset = int(offset * sampling_rate)
+            right_offset = (
+                int((offset + duration) * sampling_rate) if duration else None
+            )
+            samples = samples[..., left_offset:right_offset]
+        elif isinstance(source, tuple) and isinstance(source[0], TemporalArray):
+            samples, sampling_rate = (
+                source[0].load(
+                    start=offset,
+                    duration=duration,
+                ),
+                source[1],
+            )
+        else:
+            samples, sampling_rate = read_audio(
+                source,
+                offset=offset,
+                duration=duration,
+                force_opus_sampling_rate=force_opus_sampling_rate,
+            )
 
         # explicit sanity check for duration as soundfile does not complain here
         if duration is not None:
@@ -112,6 +137,8 @@ class AudioSource:
                     f"Requested more audio ({duration}s) than available ({available_duration}s)"
                 )
 
+        if return_rate:
+            return samples.astype(np.float32), sampling_rate
         return samples.astype(np.float32)
 
     def load_video_iter(
@@ -285,12 +312,32 @@ class AudioSource:
         return fastcopy(self, source=str(Path(path) / self.source))
 
     def to_dict(self) -> dict:
-        return asdict_nonull(self)
+        data = asdict_nonull(self)
+        if not self._get_format(avoid_error=True) == "array":
+            return data
+
+        if isinstance(self.source[0], np.ndarray):
+            raise ValueError(
+                "Cannot serialize AudioSource with 'ndarray' source type to JSON, which is horrible!"
+            )
+        elif isinstance(self.source[0], TemporalArray):
+            data["source"] = (self.source[0].to_dict(), self.source[1])
+
+        return data
 
     @staticmethod
     def from_dict(data) -> "AudioSource":
         if "video" in data:
             data["video"] = VideoInfo.from_dict(data["video"])
+        if (
+            "source" in data
+            and isinstance(data["source"], list)
+            and data["type"] == "array"
+        ):
+            data["source"] = (
+                TemporalArray.from_dict(data["source"][0]),
+                data["source"][1],
+            )
         return AudioSource(**data)
 
     def __repr__(self):
@@ -313,6 +360,8 @@ class AudioSource:
             "url",
             "memory",
             "shar",
+            "array",
+            "ndarray",
         ), f"Unexpected AudioSource type: '{self.type}'"
 
         source = self.source
@@ -337,7 +386,7 @@ class AudioSource:
 
         elif self.type == "url":
 
-            if offset != 0.0 or duration is not None and not AudioCache.enabled():
+            if (offset != 0.0 or duration is not None) and not AudioCache.enabled():
                 warnings.warn(
                     "You requested a subset of a recording that is read from URL. "
                     "Expect large I/O overhead if you are going to read many chunks like these, "
@@ -354,6 +403,26 @@ class AudioSource:
                 AudioCache.add_to_cache(self.source, audio_bytes)
             source = BytesIO(audio_bytes)
 
+        elif self.type == "file":
+
+            if (offset != 0.0 or duration is not None) and not AudioCache.enabled():
+                warnings.warn(
+                    "You requested a subset of a recording that is read from disk. "
+                    "Expect large I/O overhead if you are going to read many chunks like these, "
+                    "since every time we will read the whole file rather than its subset."
+                    "You can use `lhotse.set_caching_enabled(True)` to mitigate the overhead."
+                )
+
+            # Let's assume 'self.source' is a path to unchangeable file,
+            # never a microphone-stream or a live-stream.
+            if AudioCache.enabled():
+                audio_bytes = AudioCache.try_cache(self.source)
+                if not audio_bytes:
+                    with SmartOpen.open(self.source, "rb") as f:
+                        audio_bytes = f.read()
+                    AudioCache.add_to_cache(self.source, audio_bytes)
+                source = BytesIO(audio_bytes)
+
         elif self.type == "memory":
 
             assert isinstance(self.source, bytes), (
@@ -369,9 +438,47 @@ class AudioSource:
                 "that was not filled during deserialization."
             )
 
+        elif self.type == "ndarray":
+
+            assert (
+                isinstance(self.source, tuple)
+                and isinstance(self.source[0], np.ndarray)
+                and isinstance(self.source[1], int)
+            ), (
+                "Corrupted manifest: specified AudioSource type is 'array', "
+                f"but 'self.source' attribute is not of type 'np.ndarray' (found: '{self.source}')."
+            )
+
+        elif self.type == "array":
+
+            assert (
+                isinstance(self.source, tuple)
+                and isinstance(self.source[0], TemporalArray)
+                and isinstance(self.source[1], int)
+            ), (
+                "Corrupted manifest: specified AudioSource type is 'array', "
+                f"but 'self.source' attribute is not of type 'Array' (found: '{self.source}')."
+            )
+
+            if not self.source[0].is_in_memory:
+                key = self.source[0].id
+
+                audio_bytes = AudioCache.try_cache(key)
+                if not audio_bytes:
+                    value = self.source[0].load()
+                    buf = BytesIO()
+                    np.save(buf, value, allow_pickle=False)
+                    audio_bytes = buf.getvalue()
+                    AudioCache.add_to_cache(key, audio_bytes)
+                else:
+                    buf = BytesIO(audio_bytes)
+                    value = np.load(buf, allow_pickle=False)
+
+                source = (value, self.source[1])
+
         return source
 
-    def _get_format(self) -> str:
+    def _get_format(self, avoid_error: bool = False) -> str:
         """Get format for the audio source.
         If using 'file' or 'url' types, the format is inferred from the file extension, as in soundfile.
         If using 'memory' type, the format is inferred from the binary data.
@@ -387,6 +494,10 @@ class AudioSource:
                 return "opus"
             else:
                 return sf_info.format.lower()
+        elif self.type in ("array", "ndarray"):
+            return "array"
+        elif avoid_error:
+            return "unknown"
         else:
             raise NotImplementedError(
                 f"Getting format not implemented for source type {self.type}"

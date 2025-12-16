@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from fractions import Fraction
 from io import BytesIO
 from math import ceil, isclose
 from pathlib import Path
@@ -21,6 +22,7 @@ from lhotse.augmentation import (
     DereverbWPE,
     LoudnessNormalization,
     Narrowband,
+    OneChannel,
     Resample,
     ReverbWithImpulseResponse,
     Speed,
@@ -366,12 +368,66 @@ class Recording:
             duration=ifnone(duration, self.duration),
         )
 
+    def move_to(
+        self,
+        type: str = "ndarray",
+        writer: Optional["FeaturesWriter"] = None,  # noqa: F821
+        apply_transforms: bool = False,
+        fix_num_samples: bool = True,
+    ) -> "Recording":
+        def move_src(audio_arr, sr, _id):
+            if type == "ndarray":
+                return AudioSource(
+                    type="ndarray", channels=self.channel_ids, source=(audio_arr, sr)
+                )
+            elif type == "array":
+                assert (
+                    writer is not None
+                ), "When type='array', a FeaturesWriter must be provided."
+                manifest = writer.store_array(
+                    key=_id,
+                    value=audio_arr,
+                    frame_shift=Fraction(1, sr),
+                    start=0,
+                    temporal_dim=-1,  # last dim
+                )
+                return AudioSource(
+                    type="array", channels=self.channel_ids, source=(manifest, sr)
+                )
+
+        if apply_transforms and self.transforms:
+            audio_array = self.load_audio(fix_num_samples=fix_num_samples)
+            sr = self.sampling_rate
+            return fastcopy(
+                self,
+                transforms=None,
+                sources=[move_src(audio_array, sr, self.id)],
+            )
+
+        sources = []
+        for src_idx, src in enumerate(self.sources):
+            if src.type == "ndarray":
+                sources.append(src)
+                continue
+
+            audio_array, sr = src.load_audio(return_rate=True)
+            sources.append(
+                move_src(
+                    audio_array,
+                    sr,
+                    f"{self.id}_{src_idx}",
+                )
+            )
+
+        return fastcopy(self, sources=sources)
+
     def to_dict(self) -> dict:
         d = asdict_nonull(self)
         if self.transforms is not None:
             d["transforms"] = [
                 t if isinstance(t, dict) else t.to_dict() for t in self.transforms
             ]
+        d["sources"] = [s.to_dict() for s in self.sources]
         return d
 
     def to_cut(self):
@@ -396,6 +452,7 @@ class Recording:
         channels: Optional[Channels] = None,
         offset: Seconds = 0.0,
         duration: Optional[Seconds] = None,
+        fix_num_samples: bool = True,
     ) -> np.ndarray:
         """
         Read the audio samples from the underlying audio source (path, URL, unix pipe/command).
@@ -455,6 +512,9 @@ class Recording:
             samples = source.load_audio(
                 offset=offset_aug,
                 duration=duration_aug,
+                # FIXME: If resampled, the self.sampling_rate is the target sampling rate after transforms=[Resample] ?
+                # opus: will correctly resample;
+                # wav/etc: will ignore this input (force_opus_sampling_rate no-effect)
                 force_opus_sampling_rate=self.sampling_rate,
             )
 
@@ -484,13 +544,17 @@ class Recording:
                 duration=orig_duration,
                 recording=self,
                 tolerance=1e6,
-                pad_mode="constant",
+                pad_mode="constant" if fix_num_samples else None,
             )
         else:
             # Transformation chains can introduce small mismatches in the number of samples:
             # we'll fix them here, or raise an error if they exceeded a tolerance threshold.
             audio = assert_and_maybe_fix_num_samples(
-                audio, offset=offset, duration=orig_duration, recording=self
+                audio,
+                offset=offset,
+                duration=orig_duration,
+                recording=self,
+                pad_mode="reflect" if fix_num_samples else None,
             )
 
         return audio
@@ -919,7 +983,9 @@ class Recording:
             transforms=transforms,
         )
 
-    def resample(self, sampling_rate: int) -> "Recording":
+    def resample(
+        self, sampling_rate: int, backend: Optional[str] = None
+    ) -> "Recording":
         """
         Return a new ``Recording`` that will be lazily resampled while loading audio.
         :param sampling_rate: The new sampling rate.
@@ -933,6 +999,7 @@ class Recording:
             Resample(
                 source_sampling_rate=self.sampling_rate,
                 target_sampling_rate=sampling_rate,
+                backend=backend,
             )
         )
 
@@ -950,6 +1017,11 @@ class Recording:
             sampling_rate=sampling_rate,
             transforms=transforms,
         )
+
+    def one_channel(self, method: str = "avg") -> "Recording":
+        transforms = self.transforms.copy() if self.transforms is not None else []
+        transforms.append(OneChannel(method))
+        return fastcopy(self, transforms=transforms, channel_ids=[0])
 
     @staticmethod
     def from_dict(data: dict) -> "Recording":
@@ -972,7 +1044,7 @@ def assert_and_maybe_fix_num_samples(
     duration: Optional[Seconds],
     recording: Recording,
     tolerance: Optional[Seconds] = None,
-    pad_mode: str = "reflect",
+    pad_mode: Optional[str] = "reflect",
 ) -> np.ndarray:
     # When resampling in high sampling rates (48k -> 44.1k)
     # it is difficult to estimate how sox will perform rounding;
@@ -990,10 +1062,12 @@ def assert_and_maybe_fix_num_samples(
         return audio  # this is normal condition
     allowed_diff = int(ceil(tolerance * recording.sampling_rate))
     if 0 < diff <= allowed_diff:
-        audio = np.pad(audio, ((0, 0), (0, diff)), mode=pad_mode)
+        if pad_mode is not None:
+            audio = np.pad(audio, ((0, 0), (0, diff)), mode=pad_mode)
         return audio
     elif -allowed_diff <= diff < 0:
-        audio = audio[:, :diff]
+        if pad_mode is not None:
+            audio = audio[:, :diff]
         return audio
     else:
         raise AudioLoadingError(
@@ -1001,5 +1075,5 @@ def assert_and_maybe_fix_num_samples(
             f"when loading audio (offset={offset}, duration={duration}). "
             f"This could be internal Lhotse's error or a faulty transform implementation. "
             "Please report this issue in Lhotse and show the "
-            f"following: diff={diff}, audio.shape={audio.shape}, recording={recording}"
+            f"following: diff=({diff / recording.sampling_rate}, {diff}), audio=({audio.shape[-1] / recording.sampling_rate}, {audio.shape}), recording={recording}"
         )

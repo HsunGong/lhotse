@@ -1,6 +1,7 @@
 import pickle
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
+from fractions import Fraction
 from functools import lru_cache
 from io import BytesIO
 from math import ceil, floor
@@ -73,7 +74,7 @@ class FeaturesWriter(metaclass=ABCMeta):
         self,
         key: str,
         value: np.ndarray,
-        frame_shift: Optional[Seconds] = None,
+        frame_shift: Union[None, Seconds, Fraction] = None,
         temporal_dim: Optional[int] = None,
         start: Seconds = 0,
     ) -> Union[Array, TemporalArray]:
@@ -168,12 +169,33 @@ class FeaturesReader(metaclass=ABCMeta):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         ...
 
 
 READER_BACKENDS = {}
 WRITER_BACKENDS = {}
+
+
+def read_chunk(
+    arr,
+    left_offset_frames: int = 0,
+    right_offset_frames: Optional[int] = None,
+    temporal_dim: int = 0,
+) -> np.ndarray:
+    if temporal_dim == 0:
+        return arr[left_offset_frames:right_offset_frames]
+    elif temporal_dim == -1:
+        return arr[..., left_offset_frames:right_offset_frames]
+    else:
+        d = temporal_dim % arr.ndim
+        sl = (
+            (slice(None),) * d
+            + (slice(left_offset_frames, right_offset_frames),)
+            + (...,)
+        )
+        return arr[sl]
 
 
 def available_storage_backends() -> List[str]:
@@ -263,16 +285,17 @@ class FileIO:
 
         Yields a tuple of (open_file_object, path_or_url).
         """
-        assert not (
-            "r" in mode and "w" in mode
+        assert mode in (
+            "r",
+            "w",
         ), "Opening for both reading and writing is not supported."
-        if "r" in mode:
+        if "r" == mode:
             if key.startswith("/") and len(self.storage_path) > 0:
                 key = key[1:]
             input_path = f"{self.storage_path}/{key}"
             with open_best(input_path, "rb") as f:
                 yield f, input_path
-        elif "w" in mode:
+        elif "w" == mode:
             if self.is_url:
                 if key.startswith("/"):
                     key = key[1:]
@@ -318,10 +341,11 @@ class LilcomFilesReader(FeaturesReader):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         with self.io.open_fileobj(key, mode="r") as (f, input_path):
             arr = lilcom.decompress(f.read())
-        return arr[left_offset_frames:right_offset_frames]
+        return read_chunk(arr, left_offset_frames, right_offset_frames, temporal_dim)
 
 
 @register_writer
@@ -381,10 +405,11 @@ class NumpyFilesReader(FeaturesReader):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         with self.io.open_fileobj(key, mode="r") as (f, input_path):
             arr = np.load(f, allow_pickle=False)
-        return arr[left_offset_frames:right_offset_frames]
+        return read_chunk(arr, left_offset_frames, right_offset_frames, temporal_dim)
 
 
 @register_writer
@@ -398,9 +423,12 @@ class NumpyFilesWriter(FeaturesWriter):
 
     name = "numpy_files"
 
-    def __init__(self, storage_path: Pathlike, *args, **kwargs):
+    def __init__(
+        self, storage_path: Pathlike, add_subdir: bool = True, *args, **kwargs
+    ):
         super().__init__()
         self.io = FileIO(storage_path)
+        self.add_subdir = add_subdir
 
     @property
     def storage_path(self) -> str:
@@ -409,10 +437,16 @@ class NumpyFilesWriter(FeaturesWriter):
     def write(self, key: str, value: np.ndarray) -> str:
         if not key.endswith(".npy"):
             key = key + ".npy"
-        with self.io.open_fileobj(key, "w", add_subdir=True) as (f, output_path):
+        with self.io.open_fileobj(key, "w", add_subdir=self.add_subdir) as (
+            f,
+            output_path,
+        ):
             np.save(f, value, allow_pickle=False)
             if not self.io.is_url:
-                key = "/".join(Path(output_path).parts[-2:])
+                if self.add_subdir:
+                    key = "/".join(Path(output_path).parts[-2:])
+                else:
+                    key = Path(output_path).parts[-1]
         return key
 
 
@@ -484,10 +518,13 @@ class NumpyHdf5Reader(FeaturesReader):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         # (pzelasko): If I understand HDF5/h5py correctly, this implementation reads only
         # the requested slice of the array into memory - but don't take my word for it.
-        return self.hdf[key][left_offset_frames:right_offset_frames]
+        return read_chunk(
+            self.hdf[key], left_offset_frames, right_offset_frames, temporal_dim
+        )
 
 
 @register_writer
@@ -567,13 +604,14 @@ class LilcomHdf5Reader(FeaturesReader):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         # This weird indexing with [()] is a replacement for ".value" attribute,
         # that got deprecated with the following warning:
         # H5pyDeprecationWarning: dataset.value has been deprecated. Use dataset[()] instead.
         #     arr = lilcom.decompress(self.hdf[key].value.tobytes())
         arr = lilcom.decompress(self.hdf[key][()].tobytes())
-        return arr[left_offset_frames:right_offset_frames]
+        return read_chunk(arr, left_offset_frames, right_offset_frames, temporal_dim)
 
 
 @register_writer
@@ -667,6 +705,7 @@ class ChunkedLilcomHdf5Reader(FeaturesReader):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         # First, determine which range of chunks need to be read.
         chunk_size = lookup_chunk_size(self.hdf)
@@ -695,7 +734,7 @@ class ChunkedLilcomHdf5Reader(FeaturesReader):
         else:
             right_offset_shift = None
 
-        return arr[left_offset_shift:right_offset_shift]
+        return read_chunk(arr, left_offset_shift, right_offset_shift, temporal_dim)
 
 
 @register_writer
@@ -822,6 +861,7 @@ class LilcomChunkyReader(FeaturesReader):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         # First, determine which range of chunks need to be read.
         left_chunk_idx = floor(left_offset_frames / self.CHUNK_SIZE)
@@ -857,7 +897,7 @@ class LilcomChunkyReader(FeaturesReader):
         else:
             right_offset_shift = None
 
-        return arr[left_offset_shift:right_offset_shift]
+        return read_chunk(arr, left_offset_shift, right_offset_shift, temporal_dim)
 
 
 @register_writer
@@ -970,8 +1010,11 @@ class LilcomURLReader(FeaturesReader):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
-        return self._inner.read(key, left_offset_frames, right_offset_frames)
+        return self._inner.read(
+            key, left_offset_frames, right_offset_frames, temporal_dim=temporal_dim
+        )
 
 
 @register_writer
@@ -1058,13 +1101,14 @@ class KaldiReader(FeaturesReader):
         key: str,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         if self.storage is not None:
             arr = np.copy(self.storage[key])
         else:
             arr = self.reader.read(self.storage_path).numpy()
 
-        return arr[left_offset_frames:right_offset_frames]
+        return read_chunk(arr, left_offset_frames, right_offset_frames, temporal_dim)
 
 
 @register_writer
@@ -1171,9 +1215,10 @@ class MemoryLilcomReader(FeaturesReader):
         raw_data: bytes,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         arr = lilcom.decompress(raw_data)
-        return arr[left_offset_frames:right_offset_frames]
+        return read_chunk(arr, left_offset_frames, right_offset_frames, temporal_dim)
 
 
 @register_writer
@@ -1225,9 +1270,10 @@ class MemoryRawReader(FeaturesReader):
         raw_data: bytes,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         arr = pickle.loads(raw_data)
-        return arr[left_offset_frames:right_offset_frames]
+        return read_chunk(arr, left_offset_frames, right_offset_frames, temporal_dim)
 
 
 @register_writer
@@ -1271,10 +1317,39 @@ class MemoryNpyReader(FeaturesReader):
         raw_data: bytes,
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
+        temporal_dim: int = 0,
     ) -> np.ndarray:
         stream = BytesIO(raw_data)
         arr = np.load(stream)
-        return arr[left_offset_frames:right_offset_frames]
+        return read_chunk(arr, left_offset_frames, right_offset_frames, temporal_dim)
+
+
+@register_writer
+class MemoryNpyWriter(FeaturesWriter):
+    """ """
+
+    name = "memory_npy"
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    @property
+    def storage_path(self) -> None:
+        return None
+
+    def write(self, key: str, value: np.ndarray) -> bytes:
+        buf = BytesIO()
+        np.save(buf, value, allow_pickle=False)
+        return buf.getvalue()
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
 
 
 @register_reader

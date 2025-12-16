@@ -26,6 +26,7 @@ from typing import (
     Union,
 )
 
+import joblib
 import numpy as np
 import torch
 from intervaltree import IntervalTree
@@ -953,11 +954,47 @@ class CutSet(Serializable, AlgorithmMixin):
         self,
         transform_fn: Callable[[T], T],
         apply_fn: Optional[Callable[[T], bool]] = is_cut,
+        num_jobs: int = 1,
+        executor: Optional[Executor] = None,
+        progress_bar: bool = False,
     ) -> "CutSet":
-        ans = CutSet(LazyMapper(self.data, fn=transform_fn, apply_fn=apply_fn))
-        if self.is_lazy:
-            return ans
-        return ans.to_eager()
+        from cytoolz import identity
+
+        progress = identity
+
+        if progress_bar:
+            progress = partial(
+                tqdm,
+                total=len(self),
+                desc="Mapping progress",
+            )
+
+        if num_jobs == 1:
+            ans = CutSet(
+                progress(LazyMapper(self.data, fn=transform_fn, apply_fn=apply_fn))
+            )
+            if self.is_lazy:
+                return ans
+            return ans.to_eager()
+
+        assert (
+            not self.is_lazy
+        ), "Cannot use num_jobs > 1 with lazy CutSet, try to_eager() first"
+
+        def mapper(c):
+            if apply_fn(c):
+                return transform_fn(c)
+            return c
+
+        new_cuts = []
+        for new_c in progress(
+            joblib.Parallel(num_jobs=num_jobs, return_as="generator")(
+                joblib.delayed(mapper)(c) for c in self
+            )
+        ):
+            new_cuts.append(new_c)
+
+        return CutSet.from_cuts(new_cuts)
 
     def filter_supervisions(
         self, predicate: Callable[[SupervisionSegment], bool]
@@ -1014,6 +1051,7 @@ class CutSet(Serializable, AlgorithmMixin):
         context_direction: Literal["center", "left", "right", "random"] = "center",
         keep_all_channels: bool = False,
         num_jobs: int = 1,
+        do_lazy: bool = False,
     ) -> "CutSet":
         """
         Return a new CutSet with Cuts that have identical spans as their supervisions.
@@ -1064,7 +1102,7 @@ class CutSet(Serializable, AlgorithmMixin):
         """
 
         if num_jobs == 1:
-            return CutSet(
+            result = CutSet(
                 LazyFlattener(
                     LazyMapper(
                         self,
@@ -1078,6 +1116,9 @@ class CutSet(Serializable, AlgorithmMixin):
                     )
                 )
             )
+            if self.is_lazy or do_lazy:
+                return result
+            return result.to_eager()
 
         from lhotse.manipulation import split_parallelize_combine
 
@@ -1090,7 +1131,9 @@ class CutSet(Serializable, AlgorithmMixin):
             context_direction=context_direction,
             keep_all_channels=keep_all_channels,
         )
-        return result
+        if self.is_lazy or do_lazy:
+            return result
+        return result.to_eager()
 
     def reverse_trim_to_supervisions(self) -> "CutSet":
         """

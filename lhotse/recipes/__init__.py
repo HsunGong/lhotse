@@ -70,6 +70,7 @@ from .nsc import prepare_nsc
 from .peoples_speech import prepare_peoples_speech
 from .radio import prepare_radio
 from .reazonspeech import download_reazonspeech, prepare_reazonspeech
+from .reazonspeech_v2 import prepare_reazonspeech_v2
 from .rir_noise import download_rir_noise, prepare_rir_noise
 from .sbcsae import download_sbcsae, prepare_sbcsae
 from .slu import prepare_slu

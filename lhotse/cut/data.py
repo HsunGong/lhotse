@@ -26,7 +26,7 @@ from lhotse.augmentation import AugmentFn
 from lhotse.custom import CustomFieldMixin
 from lhotse.cut.base import Cut
 from lhotse.features import FeatureExtractor, Features
-from lhotse.features.io import FeaturesWriter
+from lhotse.features.io import FeaturesWriter, NumpyHdf5Writer
 from lhotse.supervision import SupervisionSegment
 from lhotse.utils import (
     LOG_EPSILON,
@@ -92,6 +92,8 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
             for k, v in self.custom.items():
                 if isinstance(v, Recording):
                     d["custom"][k] = v.to_dict()
+        if self.supervisions is not None and len(self.supervisions):
+            d["supervisions"] = [s.to_dict() for s in self.supervisions]
         return {**d, "type": type(self).__name__}
 
     def iter_data(
@@ -282,6 +284,24 @@ class DataCut(Cut, CustomFieldMixin, metaclass=ABCMeta):
             custom=custom,
         )
         return cut
+
+    def move_to_ndarray(
+        self,
+    ) -> "Cut":
+        if not self.has_recording:
+            recording = self.recording
+        else:
+            recording = self.recording.move_to_ndarray()
+
+        return fastcopy(self, recording=recording)
+
+    def move_to_array(self, writer: NumpyHdf5Writer) -> "Cut":
+        if not self.has_recording:
+            recording = self.recording
+        else:
+            recording = self.recording.move_to_array(writer=writer)
+
+        return fastcopy(self, recording=recording)
 
     def attach_tensor(
         self,

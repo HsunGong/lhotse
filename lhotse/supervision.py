@@ -1,6 +1,7 @@
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import cached_property
 from itertools import groupby, islice
 from typing import (
     Annotated,
@@ -16,6 +17,8 @@ from typing import (
     Union,
 )
 
+import numpy as np
+from numpy.typing import NDArray
 from tqdm import tqdm
 
 from lhotse.custom import CustomFieldMixin
@@ -40,18 +43,111 @@ from lhotse.utils import (
 
 
 @dataclass
-class OCRItem:
+class OCRItem(CustomFieldMixin):
     """
     This class contains an OCR item, for example a word, along with its
     start time, end time, final bbox and the candidate texts.
+
+    i.e.
+    [0] ----- [1] left-top, right-top
+     |         |
+     |         |
+    [3] ----- [2] left-bottom, right-bottom
     """
 
-    start: float
-    end: float
-    bbox: Annotated[list[int], Literal[4]]
+    start: Seconds
+    end: Seconds
     candidate_texts: list[str]
     candidate_scores: list[float]
-    end_index: int = 0
+    candidate_bboxes: list[NDArray[np.int_]]  # [w_left, w_right, h_low, h_high]
+    end_index: Optional[
+        int
+    ] = None  # Optional index of the end frame in the video, if applicable
+
+    def __str__(self):
+        return (
+            f"OCRItem(start={self.start}, end={self.end}, "
+            f"candidate_texts={self.candidate_texts}, "
+            f"candidate_scores={self.candidate_scores}, "
+            f"estimated bbox={self.bbox})"
+        )
+
+    def to_dict(self) -> dict:
+        if len(self.candidate_bboxes) == 0:
+            return asdict_nonull(self)
+        else:
+            candidate_bboxes = [_.tolist() for _ in self.candidate_bboxes]
+            data = asdict_nonull(fastcopy(self, candidate_bboxes=candidate_bboxes))
+            return data
+
+    @staticmethod
+    def from_dict(data: dict) -> "OCRItem":
+        if "candidate_bboxes" in data:
+            data["candidate_bboxes"] = [
+                np.array(_, dtype=np.int64) for _ in data["candidate_bboxes"]
+            ]
+
+        return OCRItem(**data)
+
+    @property
+    def bbox(self) -> NDArray[np.int_]:
+        """
+        Get the bounding box of the OCR item.
+        :return: [w_left, w_right, h_low, h_high]
+        """
+        return np.mean(self.candidate_bboxes, axis=0).astype(np.int64)
+
+    def append_candidate(self, dt_box, text: str, score: float):
+        self.candidate_texts.append(text)
+        self.candidate_scores.append(score)
+        self.candidate_bboxes.append(OCRItem.get_bbox_from_one(dt_box))
+
+    def extend_candidate(self, right: "OCRItem"):
+        self.candidate_texts.extend(right.candidate_texts)
+        self.candidate_scores.extend(right.candidate_scores)
+        self.candidate_bboxes.extend(right.candidate_bboxes)
+
+    @staticmethod
+    def get_bbox_from_one(box: list[tuple[int, int]]):
+        return np.array(
+            [
+                min(box[0][0], box[3][0]),  # w_left (x_min)
+                max(box[1][0], box[2][0]),  # w_right (x_max)
+                min(box[0][1], box[1][1]),  # h_low (y_min)
+                max(box[2][1], box[3][1]),  # h_high (y_max)
+            ],
+            dtype=np.int64,
+        )
+
+    @staticmethod
+    def get_bbox_from_multi(boxes: Iterable[list[tuple[int, int]]]):
+        points = np.asarray([point for box in boxes for point in box], dtype=np.int64)
+        x_coords = points[:, 0]
+        y_coords = points[:, 1]
+
+        return np.array(
+            [
+                np.min(x_coords).item(),  # x_min
+                np.max(x_coords).item(),  # x_max
+                np.min(y_coords).item(),  # y_min
+                np.max(y_coords).item(),  # y_max
+            ],
+            dtype=np.int64,
+        )
+
+    @staticmethod
+    def crop_frame(
+        frame: NDArray[np.int_], box: Union[list[int], NDArray[np.int_]]
+    ) -> NDArray[np.int_]:
+        """
+        Crop the frame to the bounding box of the OCR item.
+        :param frame: The frame to crop, (H, W, C).
+        """
+        return frame[
+            box[2] : box[3],  # h_low : h_high
+            box[0] : box[1],  # w_left : w_right
+            :,
+        ]
 
 
 class AlignmentItem(NamedTuple):
@@ -227,15 +323,20 @@ class SupervisionSegment(CustomFieldMixin):
 
     id: str
     recording_id: str
-    start: Seconds
+    start: Seconds  # relative to cut start, not recording start
     duration: Seconds
     channel: Union[int, List[int]] = 0
     text: Optional[str] = None
     language: Optional[str] = None
     speaker: Optional[str] = None
     gender: Optional[str] = None
-    custom: Optional[Dict[str, Any]] = None
+    custom: Optional[
+        Dict[str, Any]
+    ] = None  # NOTE: any timestamp is relative to the recording start
     alignment: Optional[Dict[str, List[AlignmentItem]]] = None
+    ocr: Optional[
+        OCRItem
+    ] = None  # NOTE: ocr is an absolute value, relative to the recording start
 
     @property
     def end(self) -> Seconds:
@@ -292,15 +393,17 @@ class SupervisionSegment(CustomFieldMixin):
             else self.recording_id,
             start=new_start,
             duration=new_duration,
-            alignment={
-                type: [
-                    item.perturb_speed(factor=factor, sampling_rate=sampling_rate)
-                    for item in ali
-                ]
-                for type, ali in self.alignment.items()
-            }
-            if self.alignment
-            else None,
+            alignment=(
+                {
+                    type: [
+                        item.perturb_speed(factor=factor, sampling_rate=sampling_rate)
+                        for item in ali
+                    ]
+                    for type, ali in self.alignment.items()
+                }
+                if self.alignment
+                else None
+            ),
         )
 
     def perturb_tempo(
@@ -402,12 +505,14 @@ class SupervisionSegment(CustomFieldMixin):
             duration=add_durations(
                 self.duration, -end_exceeds_by, -start_exceeds_by, sampling_rate=48000
             ),
-            alignment={
-                type: [item.trim(end=end, start=start) for item in ali]
-                for type, ali in self.alignment.items()
-            }
-            if self.alignment
-            else None,
+            alignment=(
+                {
+                    type: [item.trim(end=end, start=start) for item in ali]
+                    for type, ali in self.alignment.items()
+                }
+                if self.alignment
+                else None
+            ),
         )
 
     def map(
@@ -462,16 +567,16 @@ class SupervisionSegment(CustomFieldMixin):
         )
 
     def to_dict(self) -> dict:
-        if self.alignment is None:
-            return asdict_nonull(self)
-        else:
+        data = asdict_nonull(fastcopy(self, alignment=None, ocr=None))
+        if self.ocr is not None:
+            data["ocr"] = self.ocr.to_dict()
+        if self.alignment is not None:
             alis = {
                 kind: [item.serialize() for item in ali]
                 for kind, ali in self.alignment.items()
             }
-            data = asdict_nonull(fastcopy(self, alignment=None))
             data["alignment"] = alis
-            return data
+        return data
 
     @staticmethod
     def from_dict(data: dict) -> "SupervisionSegment":
@@ -479,6 +584,9 @@ class SupervisionSegment(CustomFieldMixin):
 
         if "custom" in data:
             deserialize_custom_field(data["custom"])
+
+        if "ocr" in data:
+            data["ocr"] = OCRItem.from_dict(data["ocr"])
 
         if "alignment" in data:
             data["alignment"] = {

@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+import joblib
 from tqdm.auto import tqdm
 
 from lhotse import validate_recordings_and_supervisions
@@ -107,24 +108,21 @@ def prepare_aishell2(
 
     manifests = defaultdict(dict)
     dataset_parts = ["train", "dev", "test"]
-    for part in tqdm(
-        dataset_parts,
-        desc="Process aishell2 audio, it takes about 55  minutes using 40 cpu jobs.",
-    ):
+    for part in dataset_parts:
         logging.info(f"Processing aishell2 subset: {part}")
         # Generate a mapping: utt_id -> (audio_path, audio_info, speaker, text)
 
         if part == "train":
-            transcript_path = corpus_dir / "AISHELL-2" / "iOS" / "data" / "trans.txt"
-            wav_path = corpus_dir / "AISHELL-2" / "iOS" / "data" / "wav"
+            transcript_path = corpus_dir / "iOS" / "data" / "trans.txt"
+            wav_path = corpus_dir / "iOS" / "data" / "wav"
         else:
             # using dev_ios, test_ios
-            transcript_path = corpus_dir / "AISHELL-2" / "iOS" / f"{part}" / "trans.txt"
-            wav_path = corpus_dir / "AISHELL-2" / "iOS" / f"{part}" / "wav"
+            transcript_path = corpus_dir / "iOS" / f"{part}" / "trans.txt"
+            wav_path = corpus_dir / "iOS" / f"{part}" / "wav"
 
         transcript_dict = {}
         with open(transcript_path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line in tqdm(f, desc=f"Process transcript of aishell2/{part}"):
                 idx_transcript = line.split()
                 content = " ".join(idx_transcript[1:])
                 content = text_normalize(content)
@@ -133,38 +131,49 @@ def prepare_aishell2(
         supervisions = []
         recordings = RecordingSet.from_dir(
             path=wav_path, pattern="*.wav", num_jobs=num_jobs
-        )
+        ).to_eager()
 
-        for audio_path in wav_path.rglob("**/*.wav"):
-
+        def generate_seg(record: Recording):
+            audio_path = Path(record.sources[0].source)
             idx = audio_path.stem
             speaker = audio_path.parts[-2]
             if idx not in transcript_dict:
                 logging.warning(f"No transcript: {idx}")
                 logging.warning(f"{audio_path} has no transcript.")
-                continue
+                return None
             text = transcript_dict[idx]
             if not audio_path.is_file():
                 logging.warning(f"No such file: {audio_path}")
-                continue
+                return None
 
-            segment = SupervisionSegment(
+            return SupervisionSegment(
                 id=idx,
                 recording_id=idx,
                 start=0.0,
-                duration=recordings.duration(idx),
+                duration=record.duration,  # recordings.duration(idx),
                 channel=0,
-                language="Chinese",
+                language="zh",
                 speaker=speaker,
                 text=text.strip(),
             )
-            supervisions.append(segment)
+
+        for segment in tqdm(
+            joblib.Parallel(n_jobs=num_jobs, return_as="generator")(
+                joblib.delayed(generate_seg)(r) for r in recordings
+            ),
+            desc=f"Process audio of aishell2/{part}",
+        ):
+            if segment:
+                supervisions.append(segment)
 
         recording_set = RecordingSet.from_recordings(recordings)
         supervision_set = SupervisionSet.from_segments(supervisions)
+        logging.info("Fixing")
         recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
+        logging.info("Validating")
         validate_recordings_and_supervisions(recording_set, supervision_set)
 
+        logging.info("Writing")
         if output_dir is not None:
             supervision_set.to_file(
                 output_dir / f"aishell2_supervisions_{part}.jsonl.gz"

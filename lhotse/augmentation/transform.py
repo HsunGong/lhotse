@@ -1,4 +1,4 @@
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -6,6 +6,7 @@ import numpy as np
 from lhotse.utils import Seconds
 
 
+@dataclass
 class AudioTransform:
     """
     Base class for all audio transforms that are going to be lazily applied on

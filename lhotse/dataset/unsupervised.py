@@ -6,7 +6,6 @@ import torch
 from torch.utils.data import IterableDataset
 
 from lhotse import RecordingSet, Seconds, compute_num_samples, validate
-from lhotse.audio.backend import torchaudio_supports_ffmpeg
 from lhotse.audio.utils import suppress_audio_loading_errors
 from lhotse.augmentation import AugmentFn
 from lhotse.cut import CutSet
@@ -60,9 +59,10 @@ class UnsupervisedWaveformDataset(UnsupervisedDataset):
         }
     """
 
-    def __init__(self, collate: bool = True) -> None:
+    def __init__(self, collate: bool = True, to_mono: bool = False) -> None:
         super().__init__()
         self.collate = collate
+        self.to_mono = to_mono
 
     def __getitem__(self, cuts: CutSet) -> Dict[str, Any]:
         self._validate(cuts)
@@ -75,13 +75,14 @@ class UnsupervisedWaveformDataset(UnsupervisedDataset):
                 "audio_lens": audio_lens,
             }
         else:
-            remain_cuts = []
             remain_audios = []
             for c in cuts:
-                with suppress_audio_loading_errors():
-                    remain_audios.append(c.load_audio())
-                    remain_cuts.append(c)
-            return {"cuts": CutSet.from_cuts(remain_cuts), "audio": remain_audios}
+                if self.to_mono:
+                    audio = c.load_audio().mean(keepdims=False, axis=0)
+                else:
+                    audio = c.load_audio()
+                remain_audios.append(audio)
+            return {"cuts": cuts, "audio": remain_audios}
 
     def _validate(self, cuts: CutSet) -> None:
         validate(cuts)

@@ -67,14 +67,14 @@ _precompiled_resamplers: Dict[Tuple[int, int], torch.nn.Module] = {}
 
 
 def get_or_create_resampler(
-    source_sampling_rate: int, target_sampling_rate: int
+    source_sampling_rate: int, target_sampling_rate: int, device: str = "cpu"
 ) -> torch.nn.Module:
     global _precompiled_resamplers
 
     tpl = (source_sampling_rate, target_sampling_rate)
     if tpl not in _precompiled_resamplers:
         _precompiled_resamplers[tpl] = ResampleTensor(
-            source_sampling_rate, target_sampling_rate
+            source_sampling_rate, target_sampling_rate, device=device
         )
     return _precompiled_resamplers[tpl]
 
@@ -88,10 +88,22 @@ class Resample(AudioTransform):
     source_sampling_rate: int
     target_sampling_rate: int
 
+    backend: Optional[str] = None
+
     def __post_init__(self):
         self.source_sampling_rate = int(self.source_sampling_rate)
         self.target_sampling_rate = int(self.target_sampling_rate)
         self.resampler = get_or_create_resampler(
+            self.source_sampling_rate,
+            self.target_sampling_rate,
+            device="cpu"
+            if (self.backend is None or "cuda" not in self.backend)
+            else "cuda",
+        )
+        self.up_gcd = self.target_sampling_rate // np.gcd(
+            self.source_sampling_rate, self.target_sampling_rate
+        )
+        self.down_gcd = self.source_sampling_rate // np.gcd(
             self.source_sampling_rate, self.target_sampling_rate
         )
 
@@ -99,20 +111,48 @@ class Resample(AudioTransform):
         if self.source_sampling_rate == self.target_sampling_rate:
             return samples
 
-        if is_torchaudio_available():
+        if (
+            self.backend is None and is_torchaudio_available()
+        ) or self.backend == "torchaudio":
             if isinstance(samples, np.ndarray):
                 samples = torch.from_numpy(samples)
             augmented = self.resampler(samples)
             return augmented.numpy()
-        else:
+        elif self.backend == "torchaudio-cuda":
+            if isinstance(samples, np.ndarray):
+                samples = torch.from_numpy(samples).cuda()
+            augmented = self.resampler(samples)
+            return augmented.cpu().numpy()
+        elif self.backend is None or self.backend == "scipy":
             import scipy
 
-            gcd = np.gcd(self.source_sampling_rate, self.target_sampling_rate)
             augmented = scipy.signal.resample_poly(
                 samples,
-                up=self.target_sampling_rate // gcd,
-                down=self.source_sampling_rate // gcd,
+                up=self.up_gcd,
+                down=self.down_gcd,
                 axis=-1,
+            )
+            return augmented
+        elif self.backend == "cupy":
+            import cupy as cp
+            from cupyx.scipy.signal import resample_poly
+
+            samples = cp.asarray(samples)
+            augmented = resample_poly(
+                samples,
+                up=self.up_gcd,
+                down=self.down_gcd,
+                axis=-1,
+            )
+            return cp.asnumpy(augmented)
+        else:
+            import librosa
+
+            augmented = librosa.resample(
+                samples,
+                orig_sr=self.source_sampling_rate,
+                target_sr=self.target_sampling_rate,
+                res_type=self.backend,
             )
             return augmented
 
@@ -146,6 +186,35 @@ class Resample(AudioTransform):
         else:
             old_duration = None
         return old_offset, old_duration
+
+
+@dataclass
+class OneChannel(AudioTransform):
+    method: str  # "first" / "avg"
+
+    def __call__(self, samples: np.ndarray, *args, **kwargs) -> np.ndarray:
+        if samples.ndim == 1:
+            return samples
+        if self.method == "avg":
+            return np.mean(samples, axis=0, keepdims=True)
+        elif self.method == "first":
+            return samples[0:1, :]
+        else:
+            raise ValueError(
+                f"Unsupported method {self.method} for OneChannel transform"
+            )
+
+    def reverse_timestamps(
+        self,
+        offset: Seconds,
+        duration: Optional[Seconds],
+        sampling_rate: Optional[int],  # Not used, made for compatibility purposes
+    ) -> Tuple[Seconds, Optional[Seconds]]:
+        """
+        This method just returnes the original offset and duration as volume perturbation
+        doesn't change any these audio properies.
+        """
+        return offset, duration
 
 
 @dataclass

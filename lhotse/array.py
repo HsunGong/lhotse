@@ -1,6 +1,8 @@
 import decimal
 import warnings
 from dataclasses import asdict, dataclass
+from fractions import Fraction
+from functools import lru_cache
 from math import isclose
 from pathlib import Path
 from typing import List, Optional, Union
@@ -46,6 +48,10 @@ class Array:
 
     # Shape of the array once loaded into memory.
     shape: List[int]
+
+    @property
+    def id(self):
+        return f"{self.storage_type}@{self.storage_path}-{self.storage_key}"
 
     @property
     def ndim(self) -> int:
@@ -160,12 +166,16 @@ class TemporalArray:
 
     # The time interval (in seconds, or fraction of a second) between the start timestamps
     # of consecutive frames.
-    frame_shift: Seconds
+    frame_shift: Union[Seconds, Fraction]
 
     # Information about the time range of the features.
     # We only need to specify start, as duration can be computed from
     # the shape, temporal_dim, and frame_shift.
     start: Seconds
+
+    @property
+    def id(self):
+        return self.array.id
 
     @property
     def is_in_memory(self) -> bool:
@@ -196,10 +206,21 @@ class TemporalArray:
         return self.start + self.duration
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        if "frame_shift" in data and isinstance(self.frame_shift, Fraction):
+            data["frame_shift"] = (
+                self.frame_shift.numerator,
+                self.frame_shift.denominator,
+            )
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "TemporalArray":
+        if "frame_shift" in data and isinstance(data["frame_shift"], (list, tuple)):
+            data["frame_shift"] = Fraction(
+                data["frame_shift"][0], data["frame_shift"][1]
+            )
+
         array = Array.from_dict(data.pop("array"))
         return cls(array=array, **data)
 
@@ -252,6 +273,7 @@ class TemporalArray:
             self.array.storage_key,
             left_offset_frames=left_offset_frames,
             right_offset_frames=right_offset_frames,
+            temporal_dim=self.temporal_dim,
         )
 
     def with_path_prefix(self, path: Pathlike) -> "TemporalArray":
@@ -307,7 +329,9 @@ class TemporalArray:
 
 
 def seconds_to_frames(
-    duration: Seconds, frame_shift: Seconds, max_index: Optional[int] = None
+    duration: Seconds,
+    frame_shift: Union[Seconds, Fraction],
+    max_index: Optional[int] = None,
 ) -> int:
     """
     Convert time quantity in seconds to a frame index.
@@ -346,7 +370,7 @@ def deserialize_array(raw_data: dict) -> Union[Array, TemporalArray]:
 def pad_array(
     array: np.ndarray,
     temporal_dim: int,
-    frame_shift: Seconds,
+    frame_shift: Union[Seconds, Fraction],
     offset: Seconds,
     padded_duration: Seconds,
     pad_value: Union[int, float],

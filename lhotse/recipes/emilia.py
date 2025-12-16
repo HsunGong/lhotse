@@ -25,10 +25,12 @@ Note that you need to apply for downloading.
 
 """
 
-from concurrent.futures.thread import ThreadPoolExecutor
+import json
+import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
 
+import joblib
 from tqdm.auto import tqdm
 
 from lhotse import CutSet, MonoCut
@@ -40,8 +42,8 @@ from lhotse.utils import Pathlike
 
 def _parse_utterance(
     data_dir: Path,
-    line: dict,
-) -> Optional[Tuple[Recording, SupervisionSegment]]:
+    json_file: str,
+) -> Optional[Tuple[Recording, SupervisionSegment, MonoCut]]:
     """
     :param data_dir: Path to the data directory
     :param line: dict, it looks like below::
@@ -58,28 +60,45 @@ def _parse_utterance(
 
     :return: a tuple of "recording" and "supervision"
     """
-    full_path = data_dir / line["wav"]
-
-    if not full_path.is_file():
-        return None
+    meta_data = json.load(open(json_file))
+    if "id" in meta_data:
+        unique_id = meta_data["id"]
+        lang, session, spk, idx = unique_id.split("_")
+    else:  # emilia-yodas
+        unique_id = meta_data["_id"]
+        _splits = unique_id.split("_")
+        lang = _splits[0]
+        idx = _splits[-1]
+        session = "_".join(_splits[1:-1])
 
     recording = Recording.from_file(
-        path=full_path,
-        recording_id=full_path.stem,
+        path=Path(json_file).with_suffix(".mp3"),
+        recording_id=unique_id,
     )
+
     segment = SupervisionSegment(
-        id=recording.id,
-        recording_id=recording.id,
+        id=unique_id,
+        recording_id=unique_id,
         start=0.0,
         duration=recording.duration,
         channel=0,
-        text=line["text"],
-        language=line["language"],
-        speaker=line["speaker"],
-        custom={"dnsmos": line["dnsmos"]},
+        text=meta_data["text"],
+        language=meta_data["language"],
+        speaker=meta_data["speaker"],
+        custom={"dnsmos": meta_data["dnsmos"]},
     )
 
-    return recording, segment
+    cut = MonoCut(
+        id=recording.id,
+        recording=recording,
+        start=0,
+        duration=recording.duration,
+        supervisions=[segment],
+        channel=0,
+        custom={"session": session, "idx": idx},
+    )
+
+    return recording, segment, cut
 
 
 def prepare_emilia(
@@ -87,7 +106,7 @@ def prepare_emilia(
     lang: str,
     num_jobs: int,
     output_dir: Optional[Pathlike] = None,
-) -> CutSet:
+) -> None:
     """
     Returns the manifests which consist of the Recordings and Supervisions
 
@@ -103,63 +122,60 @@ def prepare_emilia(
     :param output_dir: Pathlike, the path where to write the manifests.
     :return: The CutSet containing the data for the given language.
     """
-    if lang is None:
-        raise ValueError("Please provide --lang")
-
-    lang_uppercase = lang.upper()
-    if lang_uppercase not in ("DE", "EN", "FR", "JA", "KO", "ZH"):
-        raise ValueError(
-            "Please provide a valid language. "
-            f"Choose from de, en, fr, ja, ko, zh. Given: {lang}"
-        )
-
     corpus_dir = Path(corpus_dir)
     assert corpus_dir.is_dir(), f"No such directory: {corpus_dir}"
-    data_dir = corpus_dir / "raw" / lang_uppercase
-    assert data_dir.is_dir(), f"No such directory: {data_dir}"
 
-    jsonl_files = data_dir.glob("*.jsonl")
+    if lang is None:
+        raise ValueError("Please provide --lang")
+    lang_uppercase = lang.upper()
+    if lang_uppercase not in ("DE", "EN", "FR", "JA", "KO", "ZH", "ALL"):
+        raise ValueError(
+            "Please provide a valid language. "
+            f"Choose from de, en, fr, ja, ko, zh, all. Given: {lang}"
+        )
 
-    cuts = []
-    futures = []
+    if lang_uppercase == "ALL":
+        for lang in ("DE", "EN", "FR", "JA", "KO", "ZH"):
+            prepare_emilia(
+                corpus_dir=corpus_dir,
+                lang=lang,
+                num_jobs=num_jobs,
+                output_dir=output_dir,
+            )
+        return
 
-    with ThreadPoolExecutor(num_jobs) as ex:
-        for jsonl_file in jsonl_files:
-            for item in tqdm(
-                # Note: People's Speech manifest.json is really a JSONL.
-                load_jsonl(jsonl_file),
-                desc=f"Processing {jsonl_file} with {num_jobs} jobs",
-            ):
-                futures.append(
-                    ex.submit(
-                        _parse_utterance,
-                        data_dir,
-                        item,
-                    )
-                )
+    lang_dir = corpus_dir / lang_uppercase
+    assert output_dir is not None, "Please provide --output-dir"
+    output_dir = Path(output_dir) / lang_uppercase
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-        for future in tqdm(futures, desc="Collecting futures"):
-            result = future.result()
-            if result is None:
+    with subprocess.Popen(
+        ["find", str(lang_dir), "-maxdepth", "3", "-name", "*.json", "-print"],
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    ) as proc, open(output_dir / f"recordings.jsonl", "w") as frecordings, open(
+        output_dir / f"supervisions.jsonl", "w"
+    ) as fsupervisions, open(
+        output_dir / f"cuts.jsonl", "w"
+    ) as fcuts:
+        pbar = tqdm(desc=f"Processing in {lang_dir}")
+        for ret in joblib.Parallel(n_jobs=num_jobs, return_as="generator")(
+            joblib.delayed(_parse_utterance)(
+                data_dir=lang_dir,
+                json_file=json_file.strip(),
+            )
+            for json_file in proc.stdout
+        ):
+            if ret is None:
                 continue
 
-            recording, segment = result
-
-            cuts.append(
-                MonoCut(
-                    id=recording.id,
-                    recording=recording,
-                    start=0,
-                    duration=recording.duration,
-                    supervisions=[segment],
-                    channel=0,
-                )
+            recording, supervision, cut = ret
+            frecordings.write(
+                json.dumps(recording.to_dict(), ensure_ascii=False) + "\n"
             )
-
-    cut_set = CutSet.from_cuts(cuts)
-
-    if output_dir is not None:
-        output_dir = Path(output_dir)
-        cut_set.to_file(output_dir / f"emilia_cuts_{lang_uppercase}.jsonl.gz")
-
-    return cut_set
+            fsupervisions.write(
+                json.dumps(supervision.to_dict(), ensure_ascii=False) + "\n"
+            )
+            fcuts.write(json.dumps(cut.to_dict(), ensure_ascii=False) + "\n")
+            pbar.update(1)

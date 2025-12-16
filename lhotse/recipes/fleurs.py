@@ -393,7 +393,7 @@ def prepare_single_fleurs_language(
             parallel_map(
                 _make_recording,
                 (
-                    corpus_dir / f"{dset}/{s.recording_id}.wav"
+                    corpus_dir / f"audio/{dset}/{s.recording_id}.wav"
                     for s in supervisions[dset]
                 ),
                 num_jobs=num_jobs,

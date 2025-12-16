@@ -83,6 +83,7 @@ class Resample(torch.nn.Module):
         rolloff: float = 0.99,
         beta: Optional[float] = None,
         *,
+        device: str = "cpu",
         dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
@@ -104,6 +105,7 @@ class Resample(torch.nn.Module):
                 self.rolloff,
                 self.resampling_method,
                 beta,
+                device=device,
                 dtype=dtype,
             )
             self.register_buffer("kernel", kernel)

@@ -1,8 +1,10 @@
+import contextlib
 import logging
 import os
 import re
 import sys
 import traceback
+import warnings
 from contextlib import contextmanager
 from functools import lru_cache
 from io import BytesIO, IOBase
@@ -785,6 +787,108 @@ class LibsndfileCompatibleAudioInfo(NamedTuple):
     video: Optional[VideoInfo] = None
 
 
+class FfmpegSubprocessBackend(AudioreadBackend):
+    def __init__(self):
+        super().__init__()
+
+    def info(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        force_opus_sampling_rate: Optional[int] = None,
+    ):
+        if isinstance(path_or_fd, BytesIO):
+            warnings.warn(
+                "FFMPEG subprocess backend cannot read from BytesIO, try libnsdfile."
+            )
+            return soundfile_info(path_or_fd)
+        return ffmpeg_info(path_or_fd)
+
+    def read_audio(
+        self,
+        path_or_fd: Union[Pathlike, FileObject],
+        offset: Seconds = 0.0,
+        duration: Optional[Seconds] = None,
+        force_opus_sampling_rate: Optional[int] = None,
+    ) -> Tuple[np.ndarray, int]:
+        audio, sr = ffmpeg_load(path_or_fd, offset, duration)
+        return audio, sr
+
+    def is_applicable(self, path_or_fd: Union[Pathlike, FileObject]) -> bool:
+        return True
+
+    def supports_save(self) -> bool:
+        return True
+
+    def save_audio(
+        self,
+        dest: Union[str, Path, BytesIO],
+        src: Union[torch.Tensor, np.ndarray],
+        sampling_rate: int,
+        format: Optional[str] = None,
+        encoding: Optional[str] = None,
+    ) -> None:
+        if torch.is_tensor(src):
+            src = src.detach().cpu().numpy()
+        if src.ndim == 1:
+            src = src[np.newaxis, :]
+
+        src = src.T
+
+        if src.dtype != np.float32:
+            src = src.astype(np.float32)
+
+        import subprocess
+
+        cmd = [
+            "ffmpeg",
+            "-threads",
+            "1",
+            "-f",
+            "f32le",
+            "-ar",
+            str(sampling_rate),
+            "-ac",
+            str(src.shape[1]),
+            "-i",
+            "pipe:0",
+            "-y",
+            "-loglevel",
+            "error",
+        ]
+
+        if encoding:
+            cmd += ["-c:a", encoding]
+
+        if format == "m4a":
+            cmd += ["-f", "mp4", "-acodec", "aac"]
+        else:
+            cmd += ["-f", format]
+
+        capture_output = False
+        if isinstance(dest, (str, Path)):
+            cmd.append(str(dest))
+        else:
+            cmd.append("pipe:1")
+            capture_output = True
+
+        proc = subprocess.run(
+            cmd,
+            input=src.astype(np.float32).tobytes(),
+            stdout=subprocess.PIPE if capture_output else None,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+
+        if proc.returncode != 0:
+            raise AudioSavingError(
+                f"FFMPEG failed to save audio to '{dest}'. "
+                f"FFMPEG stderr: {proc.stderr.decode('utf-8')}"
+            )
+
+        if not isinstance(dest, (str, Path)):
+            dest.write(proc.stdout)
+
+
 @lru_cache(maxsize=1)
 def torchaudio_supports_ffmpeg() -> bool:
     """
@@ -1111,6 +1215,11 @@ def soundfile_load(
 ) -> Tuple[np.ndarray, int]:
     import soundfile as sf
 
+    if isinstance(path_or_fd, (str, Path)) and ".tar/" in str(path_or_fd):
+        from lhotse.serialization import TarAsDirBackend
+
+        path_or_fd = TarAsDirBackend().open(path_or_fd)
+
     with sf.SoundFile(path_or_fd) as sf_desc:
         sampling_rate = sf_desc.samplerate
         if offset > 0:
@@ -1125,6 +1234,104 @@ def soundfile_load(
             sf_desc.read(frames=frame_duration, dtype=np.float32, always_2d=True).T,
             int(sampling_rate),
         )
+
+
+def ffmpeg_info(
+    path_or_fd: Union[Pathlike, FileObject],
+):
+    import json
+    import subprocess
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=duration,channels,sample_rate",
+        "-of",
+        "json",
+    ]
+    if isinstance(path_or_fd, BytesIO):
+        result = subprocess.run(
+            cmd + ["pipe:0"],
+            input=path_or_fd.getvalue(),
+            capture_output=True,
+            check=True,
+        )
+    else:
+        result = subprocess.run(
+            cmd + [str(path_or_fd)], capture_output=True, check=True
+        )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
+
+    audio_stream = json.loads(result.stdout)["streams"][0]
+
+    channels = int(audio_stream["channels"])
+    samplerate = int(audio_stream["sample_rate"])
+    if "duration" in audio_stream:
+        duration = float(audio_stream["duration"])
+    elif "nb_frames" in audio_stream and int(audio_stream["nb_frames"]) > 0:
+        duration = int(audio_stream["nb_frames"]) / samplerate
+    else:
+        warnings.warn(
+            f"ffmpeg failed to extract duration from: {result.stdout.decode()}"
+        )
+        duration = 0.0
+
+    frames = int(round(duration * samplerate))
+
+    return LibsndfileCompatibleAudioInfo(
+        channels=channels,
+        frames=frames,
+        samplerate=samplerate,
+        duration=duration,
+    )
+
+
+def ffmpeg_load(
+    path_or_fd: Union[Pathlike, FileObject],
+    offset: Seconds = 0.0,
+    duration: Optional[Seconds] = None,
+):
+    import subprocess
+
+    cmd = ["ffmpeg", "-threads", "1", "-loglevel", "error", "-hide_banner"]
+
+    if offset > 0:
+        cmd += ["-ss", str(offset)]
+    if isinstance(path_or_fd, BytesIO):
+        cmd += ["-i", "pipe:0"]
+    else:
+        cmd += ["-i", str(path_or_fd)]
+    if duration is not None:
+        cmd += ["-t", str(duration)]
+
+    cmd += ["-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"]
+
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if isinstance(path_or_fd, BytesIO) else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    audio_bytes, err = process.communicate(
+        input=path_or_fd.getvalue() if isinstance(path_or_fd, BytesIO) else None
+    )
+
+    if process.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {err.decode()}")
+
+    audio = np.frombuffer(audio_bytes, np.float32)
+
+    audio_info = ffmpeg_info(path_or_fd)
+    audio = audio.reshape(-1, audio_info.channels).T
+
+    return audio, audio_info.samplerate
 
 
 def audioread_info(path: Pathlike) -> LibsndfileCompatibleAudioInfo:
@@ -1427,6 +1634,12 @@ def soundfile_info(path: Pathlike) -> LibsndfileCompatibleAudioInfo:
 
     if isinstance(path, Path):
         path = str(path)
+
+    if isinstance(path, str) and ".tar/" in path:
+        from lhotse.serialization import TarAsDirBackend
+
+        path = TarAsDirBackend().open(path)
+
     info_ = sf.info(path)
     return LibsndfileCompatibleAudioInfo(
         channels=info_.channels,

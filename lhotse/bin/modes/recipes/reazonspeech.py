@@ -9,6 +9,7 @@ from lhotse.recipes.reazonspeech import (
     download_reazonspeech,
     prepare_reazonspeech,
 )
+from lhotse.recipes.reazonspeech_v2 import prepare_reazonspeech_v2
 from lhotse.utils import Pathlike
 
 __all__ = ["reazonspeech"]
@@ -57,3 +58,37 @@ def reazonspeech(target_dir: Pathlike, subset: List[str], num_jobs: int):
     if "auto" in subset:
         subset = "auto"
     download_reazonspeech(target_dir, dataset_parts=subset, num_jobs=num_jobs)
+
+
+@prepare.command(context_settings=dict(show_default=True))
+@click.argument("corpus_dir", type=click.Path(exists=True, dir_okay=True))
+@click.argument("output_dir", type=click.Path())
+@click.option(
+    "--subset",
+    type=click.Choice(["dev", "test", "all", "large", "small"], case_sensitive=False),
+    multiple=True,
+    default=["dev"],
+    help="List of dataset parts to prepare (default: small-v1). To prepare multiple parts, pass each with `--subset` "
+    "Example: `--subset all",
+)
+@click.option(
+    "-j",
+    "--num-jobs",
+    type=int,
+    default=1,
+    help="How many threads to use (can give good speed-ups with slow disks).",
+)
+def reazonspeech_v2(
+    corpus_dir: Pathlike,
+    output_dir: Pathlike,
+    subset: List[str],
+    num_jobs: int,
+):
+    """ReazonSpeech ASR data preparation."""
+    logging.basicConfig(level=logging.INFO)
+    prepare_reazonspeech_v2(
+        dataset_parts=subset,
+        corpus_dir=corpus_dir,
+        output_dir=output_dir,
+        num_jobs=num_jobs,
+    )
