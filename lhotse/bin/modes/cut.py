@@ -504,7 +504,7 @@ def estimate_bucket_bins(
     click.echo(estimate_duration_buckets(cuts, num_buckets=num_buckets))
 
 
-@cut.command("to_textgrid")
+@cut.command(name="to_textgrid")
 @click.argument("cut_path", type=click.Path(exists=True, dir_okay=False))
 @click.argument("output_dir", type=click.Path())
 @click.option(
@@ -518,8 +518,6 @@ def to_textgrid(cut_path: Pathlike, output_dir: Pathlike, text_type: str):
     """
     Export the supervisions from CUTSET to a Praat TextGrid file.
     """
-    from praatio import textgrid
-
     cut_set = CutSet.from_file(cut_path)
     cut_set = cut_set.reverse_trim_to_supervisions()
     output_dir = Path(output_dir)
@@ -531,40 +529,7 @@ def to_textgrid(cut_path: Pathlike, output_dir: Pathlike, text_type: str):
             cut.recording.duration == cut.duration
         ), f"Cut duration mismatch for {rec_id}"
 
-        # 1 cut for 1 recording
-        tg = textgrid.Textgrid()
-        spk_tiers = {}
-        for sup in cut.supervisions:
-            speaker = sup.speaker if sup.speaker is not None else "unknown"
-            if speaker not in spk_tiers:
-                spk_tiers[speaker] = textgrid.IntervalTier(
-                    speaker, [], minT=0, maxT=cut.duration
-                )
-            tier = spk_tiers[speaker]
-
-            if text_type == "text":
-                assert sup.text is not None, f"Supervision text is None for {sup}"
-                tier.insertEntry(
-                    (round(sup.start, 3), round(sup.start + sup.duration, 3), sup.text)
-                )
-            else:
-                text_type = text_type.split("-", maxsplit=1)[-1].strip()
-                key = text_type.split(" ", maxsplit=1)[-1]
-                alis = sup.alignment[key]
-                assert len(alis) > 0
-                end = 0
-                for ali in alis:
-                    # TODO: print((max(ali[1], end), ali[1] + ali[2], ali[0]))
-                    tier.insertEntry((ali.start, ali.start + ali.duration, ali.symbol))
-                    end = ali[1] + ali[2]
-
-        for tier in spk_tiers.values():
-            tg.addTier(tier)
-        tg.save(
-            output_dir / f"{rec_id}.TextGrid",
-            format="long_textgrid",
-            includeBlankSpaces=False,
-        )
+        cut.to_textgrid(output_dir / f"{rec_id}.TextGrid", text_type=text_type)
 
 
 @cut.command(name="from_textgrid")
@@ -644,3 +609,43 @@ def from_textgrid(
         supervisions=supervision_set,
         tolerance=0.1,
     ).to_file(manifest_dir / "cuts.jsonl.gz")
+
+
+@cut.command(name="to_stm")
+@click.argument("cut_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("output_dir", type=click.Path())
+def to_stm(cut_path: Pathlike, output_dir: Pathlike):
+    """
+    Export the supervisions from CUTSET to an STM file.
+    """
+    cut_set = CutSet.from_file(cut_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for cut in cut_set:
+        rec_id = cut.recording_id
+        assert (
+            cut.recording.duration == cut.duration
+        ), f"Cut duration mismatch for {rec_id}"
+
+        cut.to_stm(output_dir / f"{rec_id}.stm")
+
+
+@cut.command(name="to_rttm")
+@click.argument("cut_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("output_dir", type=click.Path())
+def to_rttm(cut_path: Pathlike, output_dir: Pathlike):
+    """
+    Export the supervisions from CUTSET to an RTTM file.
+    """
+    cut_set = CutSet.from_file(cut_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for cut in cut_set:
+        rec_id = cut.recording_id
+        assert (
+            cut.recording.duration == cut.duration
+        ), f"Cut duration mismatch for {rec_id}"
+
+        cut.to_rttm(output_dir / f"{rec_id}.rttm")

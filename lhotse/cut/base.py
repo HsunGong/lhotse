@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 from typing import Callable, Dict, List, Literal, Optional, Set, Tuple
 
@@ -1087,3 +1088,98 @@ class Cut:
     def with_id(self, id_: str) -> "Cut":
         """Return a copy of the Cut with a new ID."""
         return fastcopy(self, id=id_)
+
+    def to_textgrid(self, path: Pathlike, text_type="text"):
+        from praatio import textgrid
+
+        rec_id = self.id
+        assert self.duration == self.duration, f"self duration mismatch for {rec_id}"
+
+        # 1 self for 1 recording
+        tg = textgrid.Textgrid()
+        spk_tiers = {}
+        for sup in self.supervisions:
+            speaker = sup.speaker if sup.speaker is not None else "unknown"
+            if speaker not in spk_tiers:
+                spk_tiers[speaker] = textgrid.IntervalTier(
+                    speaker, [], minT=0, maxT=self.duration
+                )
+            tier = spk_tiers[speaker]
+
+            if text_type == "text":
+                assert sup.text is not None, f"Supervision text is None for {sup}"
+                tier.insertEntry(
+                    (
+                        round(self.start + sup.start, 3),
+                        round(self.start + sup.start + sup.duration, 3),
+                        sup.text,
+                    )
+                )
+            else:
+                text_type = text_type.split("-", maxsplit=1)[-1].strip()
+                key = text_type.split(" ", maxsplit=1)[-1]
+                alis = sup.alignment[key]
+                assert len(alis) > 0
+                end = 0
+                for ali in alis:
+                    # NOTE: Ali is global compared to recording start
+                    tier.insertEntry((ali.start, ali.start + ali.duration, ali.symbol))
+                    end = ali[1] + ali[2]
+
+        for tier in spk_tiers.values():
+            tg.addTier(tier)
+        tg.save(
+            str(path),
+            format="long_textgrid",
+            includeBlankSpaces=False,
+        )
+
+    def to_stm(self, path: Pathlike):
+        with open(path, "w", encoding="utf-8") as f:
+            for sup in self.supervisions:
+                start = self.start + sup.start
+                end = self.start + sup.start + sup.duration
+                if sup.channel is None:
+                    channel_id = 1
+                elif isinstance(sup.channel, int):
+                    channel_id = sup.channel + 1
+                else:
+                    warnings.warn(
+                        "Supvision channel is a list; using the first channel for STM output."
+                    )
+                    channel_id = sup.channel[0] + 1
+
+                f.write(
+                    f"{self.id} "
+                    f"{channel_id} "
+                    f"{sup.speaker or '<N/A>'} "
+                    f"{start:.3f} "
+                    f"{end:.3f} "
+                    f"{sup.text or ''}\n"
+                )
+
+    def to_rttm(self, path: Pathlike):
+        with open(path, "w", encoding="utf-8") as f:
+            for sup in self.supervisions:
+                start = self.start + sup.start
+                duration = sup.duration
+                if sup.channel is None:
+                    channel_id = 1
+                elif isinstance(sup.channel, int):
+                    channel_id = sup.channel + 1
+                else:
+                    warnings.warn(
+                        "Supvision channel is a list; using the first channel for RTTM output."
+                    )
+                    channel_id = sup.channel[0] + 1
+
+                f.write(
+                    f"SPEAKER "
+                    f"{self.id} "
+                    f"{channel_id} "
+                    f"{start:.3f} "
+                    f"{duration:.3f} "
+                    f"<NA> <NA> "
+                    f"{sup.speaker or '<N/A>'} "
+                    f"<NA> <NA>\n"
+                )
