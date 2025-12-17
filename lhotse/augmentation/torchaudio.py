@@ -190,7 +190,7 @@ class Resample(AudioTransform):
 
 @dataclass
 class OneChannel(AudioTransform):
-    method: str  # "first" / "avg"
+    method: str | int  # "first" / "avg"
 
     def __call__(self, samples: np.ndarray, *args, **kwargs) -> np.ndarray:
         if samples.ndim == 1:
@@ -199,6 +199,8 @@ class OneChannel(AudioTransform):
             return np.mean(samples, axis=0, keepdims=True)
         elif self.method == "first":
             return samples[0:1, :]
+        elif isinstance(self.method, int):
+            return samples[self.method : self.method + 1, :]
         else:
             raise ValueError(
                 f"Unsupported method {self.method} for OneChannel transform"
